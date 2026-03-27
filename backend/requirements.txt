@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pytesseract
+opencv-python
+pillow
+transformers
+torch
+python-multipart
+pydantic
+qwen-vl-utils
+accelerate
+python-dateutil
+pypdf
+python-docx
+pdf2image
