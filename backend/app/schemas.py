@@ -148,6 +148,9 @@ class JobDescriptionData(BaseModel):
     required_certifications: list[str] = Field(default_factory=list, description="Required or preferred certifications")
     domain_keywords: list[str] = Field(default_factory=list, description="Domain or business context keywords")
     responsibilities: list[str] = Field(default_factory=list, description="Key responsibilities from the JD")
+    implicit_skills: list[str] = Field(default_factory=list, description="Implicit skills inferred by LLM")
+    inferred_seniority: str = Field(default="", description="Seniority level inferred by LLM")
+    domain_expectations: list[str] = Field(default_factory=list, description="Domain expectations extracted by LLM")
 
     @field_validator("title", mode="before")
     @classmethod
@@ -160,6 +163,8 @@ class JobDescriptionData(BaseModel):
         "required_education",
         "required_certifications",
         "domain_keywords",
+        "implicit_skills",
+        "domain_expectations",
         mode="before",
     )
     @classmethod
@@ -202,6 +207,8 @@ class ResumeData(BaseModel):
     projects: list[str] = Field(default_factory=list, description="Project highlights")
     total_years_experience: float = Field(default=0.0, ge=0, description="Total inferred years of experience")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Extra structured metadata captured during parsing")
+    enriched_persona: list[str] = Field(default_factory=list, description="Persona enrichment from LLM")
+    skill_clusters: dict[str, list[str]] = Field(default_factory=dict, description="Skill graph relationships mapped by LLM")
 
     @field_validator("name", "location", "summary", "linkedin", "portfolio", mode="before")
     @classmethod
@@ -253,24 +260,33 @@ class ResumeData(BaseModel):
 
     @model_validator(mode="after")
     def compute_years_of_experience(self) -> "ResumeData":
-        if self.total_years_experience:
-            return self
-
         total_months = sum(entry.duration_months for entry in self.experience_entries)
-        if total_months:
-            self.total_years_experience = round(total_months / 12, 1)
+        calculated_years = round(total_months / 12, 1)
+
+        if not self.experience_entries or calculated_years == 0:
+            self.total_years_experience = 0.0
+        else:
+            self.total_years_experience = calculated_years
+
         return self
 
 
 class CandidateScore(BaseModel):
     total_score: int = Field(default=0, ge=0, le=100)
     skills_score: int = Field(default=0, ge=0, le=40)
-    experience_score: int = Field(default=0, ge=0, le=30)
-    education_score: int = Field(default=0, ge=0, le=15)
+    experience_score: int = Field(default=0, ge=0, le=35)
+    education_score: int = Field(default=0, ge=0, le=25)
     keyword_score: int = Field(default=0, ge=0, le=10)
     completeness_score: int = Field(default=0, ge=0, le=5)
+    confidence_score: int = Field(default=0, ge=0, le=100)
+    risk_score: int = Field(default=0, ge=0, le=100)
     matched_skills: list[str] = Field(default_factory=list)
     missing_skills: list[str] = Field(default_factory=list)
+    critical_missing_skills: list[str] = Field(default_factory=list)
+    additional_relevant_skills: list[str] = Field(default_factory=list)
+    additional_skills_bonus_score: int = Field(default=0, ge=0, le=10)
+    detected_domain_tags: list[str] = Field(default_factory=list)
+    semantic_match_details: dict[str, Any] = Field(default_factory=dict)
     strengths: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     recommendation: str = Field(default="low fit")
@@ -281,6 +297,9 @@ class ScreeningResult(BaseModel):
     resume_data: ResumeData
     score: CandidateScore
     recruiter_feedback: str = Field(default="", description="Short recruiter-style summary")
+    hiring_decision: str = Field(default="", description="Model- or heuristic-generated hiring decision")
+    interview_focus_areas: list[str] = Field(default_factory=list)
+    hidden_strengths: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

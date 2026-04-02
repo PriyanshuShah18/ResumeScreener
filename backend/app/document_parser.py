@@ -8,6 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.config import Settings
+from app.constants import SUPPORTED_EXTENSIONS
 from app.ocr import OCRUnavailableError, annotate_resume_sections, get_structured_ocr
 from app.preprocess import preprocess
 
@@ -25,9 +26,6 @@ try:
     from pypdf import PdfReader
 except ImportError:  # pragma: no cover
     PdfReader = None
-
-
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
 
 
 @dataclass

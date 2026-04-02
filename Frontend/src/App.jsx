@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useRef, useMemo, useState } from "react";
 import { getApiBaseUrl, getErrorMessage } from "./api";
 
 const SCORE_WEIGHTS = [
@@ -39,6 +39,28 @@ export default function App() {
   const [jobDescription, setJobDescription] = useState("");
   const [topK, setTopK] = useState(5);
   const [resumeFiles, setResumeFiles] = useState([]);
+  const fileInputRef = useRef(null);
+
+  function handleFilesAdded(event) {
+    const incoming = Array.from(event.target.files || []);
+    if (!incoming.length) return;
+    setResumeFiles((prev) => {
+      const existingKeys = new Set(prev.map((f) => `${f.name}__${f.size}`));
+      const unique = incoming.filter((f) => !existingKeys.has(`${f.name}__${f.size}`));
+      return [...prev, ...unique];
+    });
+    // reset so the same folder can be re-selected if needed
+    event.target.value = "";
+  }
+
+  function removeFile(index) {
+    setResumeFiles((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function clearAllFiles() {
+    setResumeFiles([]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [responseData, setResponseData] = useState(null);
@@ -133,17 +155,55 @@ export default function App() {
               />
             </label>
 
-            <label>
-              Resumes
+            <div className="resume-upload-section">
+              <span className="field-label">Resumes</span>
               <input
+                ref={fileInputRef}
                 type="file"
                 multiple
                 accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.tiff,.bmp"
-                onChange={(event) =>
-                  setResumeFiles(Array.from(event.target.files || []))
-                }
+                onChange={handleFilesAdded}
+                style={{ display: "none" }}
+                id="resume-file-input"
               />
-            </label>
+              <div className="upload-actions">
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  + Add Resumes
+                </button>
+                {resumeFiles.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={clearAllFiles}
+                  >
+                    Clear All ({resumeFiles.length})
+                  </button>
+                )}
+              </div>
+
+              {resumeFiles.length > 0 && (
+                <div className="file-list" aria-live="polite">
+                  {resumeFiles.map((file, idx) => (
+                    <div className="file-list-item" key={`${file.name}__${file.size}__${idx}`}>
+                      <span className="file-name">{file.name}</span>
+                      <span className="file-size">{(file.size / 1024).toFixed(0)} KB</span>
+                      <button
+                        type="button"
+                        className="btn-remove"
+                        onClick={() => removeFile(idx)}
+                        title={`Remove ${file.name}`}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             <label>
               Candidates to Shortlist
@@ -154,14 +214,6 @@ export default function App() {
                 onChange={(event) => setTopK(event.target.value)}
               />
             </label>
-
-            {resumeFiles.length ? (
-              <div className="file-list" aria-live="polite">
-                {resumeFiles.map((file) => (
-                  <p key={`${file.name}-${file.lastModified}`}>{file.name}</p>
-                ))}
-              </div>
-            ) : null}
 
             {errorText ? <p className="error-text">{errorText}</p> : null}
 

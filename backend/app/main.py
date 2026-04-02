@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,11 +9,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent import HRExtractionService
 from app.config import get_settings
 from app.document_parser import DocumentParser
+from app.ranking import rank_results
+from app.reasoning import generate_reasoning
 from app.schemas import ScreenResumesResponse, ScreeningResult
 from app.scoring import build_recruiter_feedback, score_candidate
+from app.llm_understanding import llm_service
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+class _MultipartBoundaryFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Skipping data after last boundary" not in record.getMessage()
+
+
+logging.getLogger("python_multipart.multipart").addFilter(_MultipartBoundaryFilter())
 
 settings = get_settings()
 document_parser = DocumentParser(settings)
@@ -85,6 +97,7 @@ async def screen_resumes(
 
     try:
         job_summary = extraction_service.extract_job_description(job_description)
+        job_summary = llm_service.enrich_jd_intelligence(job_summary)
     except Exception as exc:
         logger.exception("Job description extraction failed")
         raise HTTPException(status_code=500, detail=f"Failed to parse job description: {exc}") from exc
@@ -97,35 +110,56 @@ async def screen_resumes(
     results: list[ScreeningResult] = []
     failed_count = 0
 
-    for resume in resumes:
+    async def process_single_resume(resume: UploadFile) -> ScreeningResult | Exception:
         filename = resume.filename or "unnamed"
         file_warnings: list[str] = []
-
         try:
             content = await resume.read()
-            parsed = document_parser.parse_upload(filename, content)
-            file_warnings.extend(parsed.warnings)
 
-            resume_data = extraction_service.extract_resume(parsed.text, page_images=parsed.page_images)
-            candidate_score = score_candidate(job_summary, resume_data)
-            recruiter_feedback = build_recruiter_feedback(job_summary, resume_data, candidate_score)
+            def _sync_process() -> ScreeningResult:
+                parsed = document_parser.parse_upload(filename, content)
+                file_warnings.extend(parsed.warnings)
 
-            results.append(
-                ScreeningResult(
+                resume_data = extraction_service.extract_resume(parsed.text)
+                resume_data = llm_service.enrich_candidate_persona(resume_data, job_summary)
+                
+                candidate_score = score_candidate(job_summary, resume_data)
+                reasoning_output = generate_reasoning(job_summary, resume_data, candidate_score, extraction_service)
+                recruiter_feedback = build_recruiter_feedback(
+                    job_summary,
+                    resume_data,
+                    candidate_score,
+                    reasoning_summary=reasoning_output.fit_rationale,
+                )
+
+                return ScreeningResult(
                     source_file=filename,
                     resume_data=resume_data,
                     score=candidate_score,
                     recruiter_feedback=recruiter_feedback,
+                    hiring_decision=reasoning_output.hiring_decision,
+                    interview_focus_areas=reasoning_output.interview_focus_areas,
+                    hidden_strengths=reasoning_output.hidden_strengths,
                     warnings=file_warnings,
                 )
-            )
-            warnings.extend(f"{filename}: {warning}" for warning in file_warnings)
-        except Exception as exc:
-            failed_count += 1
-            logger.exception("Resume processing failed for %s", filename)
-            warnings.append(f"{filename}: {exc}")
 
-    results.sort(key=lambda item: item.score.total_score, reverse=True)
+            return await asyncio.to_thread(_sync_process)
+        except Exception as exc:
+            logger.exception("Resume processing failed for %s", filename)
+            return exc
+
+    outcomes = await asyncio.gather(*(process_single_resume(resume) for resume in resumes))
+
+    for resume, outcome in zip(resumes, outcomes):
+        filename = resume.filename or "unnamed"
+        if isinstance(outcome, Exception):
+            failed_count += 1
+            warnings.append(f"{filename}: {outcome}")
+        else:
+            results.append(outcome)
+            warnings.extend(f"{filename}: {w}" for w in outcome.warnings)
+
+    results = rank_results(results)
     capped_top_k = min(top_k, len(results))
 
     return ScreenResumesResponse(

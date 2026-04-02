@@ -129,3 +129,9 @@ PROJECT_CHANGE_LOG.md
 
 .env.example
 HR.md
+HR_WALKTHROUGH.md
+test_generation.py
+
+# Local LLM Caches
+skill_graph_cache.json
+backend/skill_graph_cache.json

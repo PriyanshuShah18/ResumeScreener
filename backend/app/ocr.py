@@ -5,26 +5,15 @@ from typing import Iterable
 
 try:
     import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 except ImportError:  # pragma: no cover
     pytesseract = None
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 from app.config import get_settings
+from app.constants import CONTACT_HINTS, SECTION_PATTERNS
 
 
 class OCRUnavailableError(RuntimeError):
     pass
-
-SECTION_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
-    ("[SUMMARY]", ("professional summary", "profile summary", "summary", "objective", "about me")),
-    ("[SKILLS]", ("skills", "technical skills", "core competencies", "tech stack", "key skills")),
-    ("[EXPERIENCE]", ("experience", "work experience", "employment history", "professional experience")),
-    ("[EDUCATION]", ("education", "academic background", "qualifications")),
-    ("[CERTIFICATIONS]", ("certifications", "licenses", "credentials")),
-    ("[PROJECTS]", ("projects", "project experience", "key projects")),
-    ("[LINKS]", ("links", "profiles", "portfolio", "online presence")),
-]
-
-CONTACT_HINTS = ("@", "linkedin", "github", "portfolio", "phone", "mobile", "+")
 
 
 def _configure_tesseract() -> None:

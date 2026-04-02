@@ -30,6 +30,7 @@ class Settings:
     max_file_size_mb: int
     min_pdf_text_chars: int
     preload_model_on_startup: bool
+    gemini_api_key: str
 
 
 @lru_cache(maxsize=1)
@@ -43,4 +44,5 @@ def get_settings() -> Settings:
         max_file_size_mb=_get_int("MAX_FILE_SIZE_MB", 10),
         min_pdf_text_chars=_get_int("MIN_PDF_TEXT_CHARS", 300),
         preload_model_on_startup=_get_bool("PRELOAD_MODEL_ON_STARTUP", True),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
     )

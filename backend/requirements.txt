@@ -4,6 +4,7 @@ pytesseract
 opencv-python
 pillow
 transformers
+sentence-transformers
 torch
 python-multipart
 pydantic

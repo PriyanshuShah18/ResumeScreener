@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import re
 from typing import Any
 
@@ -9,8 +10,17 @@ from PIL import Image
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.constants import (
+    EXTRACTION_DOMAIN_NOISE as DOMAIN_NOISE,
+    EXTRACTION_SKILL_NOISE as SKILL_NOISE,
+    KNOWN_EDUCATION,
+    SOFT_SKILL_MARKERS,
+    TOOL_CONTEXT_MARKERS,
+)
 from app.ocr import annotate_resume_sections
 from app.schemas import JobDescriptionData, ResumeData, normalize_skill, normalize_whitespace
+
+from app.llm_understanding import llm_service
 
 try:
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
@@ -30,71 +40,6 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-KNOWN_SKILLS = {
-    "react native",
-    "ios",
-    "ios development",
-    "android",
-    "android development",
-    "swift",
-    "kotlin",
-    "xcode",
-    "expo",
-    "redux",
-    "firebase",
-    "python",
-    "java",
-    "javascript",
-    "typescript",
-    "sql",
-    "postgresql",
-    "mysql",
-    "mongodb",
-    "fastapi",
-    "django",
-    "flask",
-    "react",
-    "node.js",
-    "node",
-    "aws",
-    "azure",
-    "gcp",
-    "docker",
-    "kubernetes",
-    "terraform",
-    "git",
-    "linux",
-    "pandas",
-    "numpy",
-    "pytorch",
-    "tensorflow",
-    "scikit-learn",
-    "machine learning",
-    "deep learning",
-    "nlp",
-    "rest api",
-    "graphql",
-    "communication",
-    "leadership",
-    "agile",
-    "scrum",
-}
-
-KNOWN_EDUCATION = {
-    "b.tech",
-    "bachelor",
-    "bachelors",
-    "master",
-    "m.tech",
-    "mba",
-    "bsc",
-    "msc",
-    "phd",
-    "computer science",
-    "engineering",
-}
-
-
 class HRExtractionService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -102,6 +47,7 @@ class HRExtractionService:
         self.processor = None
         self.load_error = ""
         self.device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+        self._inference_lock = threading.Lock()
 
     @property
     def model_available(self) -> bool:
@@ -122,7 +68,11 @@ class HRExtractionService:
 
         logger.info("Loading HR extraction model %s on %s", self.settings.model_id, self.device)
         dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(self.settings.model_id, torch_dtype=dtype)
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            self.settings.model_id, 
+            dtype=dtype,
+            attn_implementation="sdpa"
+        )
         self.model.to(self.device)
         self.processor = AutoProcessor.from_pretrained(self.settings.model_id)
 
@@ -174,7 +124,7 @@ class HRExtractionService:
         messages = [self.build_message(prompt, page_images)]
 
         for attempt in range(max_retries + 1):
-            if attempt > 0 and current_error:
+            if attempt > 0 and current_error and raw_response.strip():
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append(
                     {
@@ -182,23 +132,47 @@ class HRExtractionService:
                         "content": f"Your previous output failed validation:\n{current_error}\nReturn corrected JSON only.",
                     }
                 )
+            elif attempt > 0:
+                logger.warning("Retrying with fresh prompt (attempt %d) after empty response", attempt)
+                messages = [self.build_message(prompt, page_images)]
 
             raw_response = self.generate_response(messages)
-            parsed_json = self.parse_json(raw_response)
+
+            if not raw_response.strip():
+                current_error = "Model returned an empty response"
+                logger.warning("Model returned empty response on attempt %d", attempt)
+                continue
+
+            logger.info("Model raw response (attempt %d, %d chars): %.300s", attempt, len(raw_response), raw_response)
 
             try:
+                parsed_json = self.parse_json(raw_response)
                 validated = schema_cls(**parsed_json)
                 if not self.has_meaningful_extraction(validated):
                     raise ValueError("Extraction produced an empty or low-signal structured result")
                 return self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
             except (ValidationError, ValueError) as exc:
                 current_error = str(exc)
-                logger.warning("Structured extraction validation failed: %s", exc)
+                logger.warning(
+                    "Structured extraction attempt %d failed: %s | Raw response preview: %.200s",
+                    attempt, exc, raw_response,
+                )
 
         if not input_text.strip() and page_images:
             raise RuntimeError("Vision-based extraction failed and no OCR text was available for fallback.")
+            
+        logger.warning("VLM Retries exhausted. Attempting Gemini LLM fallback extraction...")
+        fallback_json = llm_service.extract_json_from_text(input_text, schema_cls.model_json_schema())
+        if fallback_json:
+            try:
+                validated = schema_cls(**fallback_json)
+                if self.has_meaningful_extraction(validated):
+                    logger.info("Gemini LLM fallback extraction succeeded.")
+                    return self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
+            except Exception as exc:
+                logger.warning("Gemini LLM fallback validation failed: %s", exc)
 
-        logger.warning("Falling back to heuristic extraction after model retries were exhausted")
+        logger.warning("Gemini LLM also failed. Falling back to regex heuristic extraction.")
         return schema_cls(**heuristic(input_text))
 
     def has_meaningful_extraction(self, extracted) -> bool:
@@ -274,33 +248,83 @@ class HRExtractionService:
             if not process_vision_info:
                 raise RuntimeError("qwen-vl-utils is required for image-assisted extraction")
             image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.processor(
-                text=[rendered_prompt],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(self.device)
+            
+            with self._inference_lock:
+                inputs = self.processor(
+                    text=[rendered_prompt],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.device)
+                generated_ids = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False)
         else:
-            inputs = self.processor(text=[rendered_prompt], padding=True, return_tensors="pt").to(self.device)
+            with self._inference_lock:
+                inputs = self.processor(text=[rendered_prompt], padding=True, return_tensors="pt").to(self.device)
+                generated_ids = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False)
 
-        generated_ids = self.model.generate(**inputs, max_new_tokens=1200)
         trimmed_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
-        return self.processor.batch_decode(
+        decoded = self.processor.batch_decode(
             trimmed_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
 
+        # Free GPU memory between generations to avoid OOM on multi-resume runs
+        if torch and self.device == "cuda":
+            del inputs, generated_ids, trimmed_ids
+            torch.cuda.empty_cache()
+
+        return decoded
+
     def parse_json(self, response: str) -> dict[str, Any]:
+        # Step 1: Strip markdown code fences (```json ... ```)
+        stripped = re.sub(r"^```(?:json)?\s*\n?", "", response.strip(), count=1)
+        stripped = re.sub(r"\n?```\s*$", "", stripped.strip())
+
+        # Step 2: Extract content between first { and last }
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            extracted = stripped[start : end + 1]
+        elif start != -1:
+            # Truncated JSON — no closing brace found, attempt repair
+            extracted = self._repair_truncated_json(stripped[start:])
+            logger.info("Attempting truncated JSON repair (%d chars)", len(extracted))
+        else:
+            extracted = stripped
+
+        # Step 3: Remove trailing commas before } or ]
+        cleaned = re.sub(r",(\s*[\}\]])", r"\1", extracted)
+
         try:
-            start = response.find("{")
-            end = response.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(response[start : end + 1])
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return {}
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"JSON Decode Error: {exc.msg} at line {exc.lineno} col {exc.colno}. "
+                "Ensure trailing commas and unescaped quotes are avoided, and output is complete."
+            )
+
+    def _repair_truncated_json(self, partial: str) -> str:
+        """Best-effort repair of JSON truncated by token limit.
+
+        Trims any incomplete trailing value, then closes all open brackets
+        and braces so the result is at least structurally valid.
+        """
+        # Strip a trailing incomplete string value (no closing quote)
+        partial = re.sub(r',\s*"[^"]*$', "", partial)          # key missing value
+        partial = re.sub(r':\s*"[^"]*$', ': ""', partial)      # value mid-string
+        partial = re.sub(r',\s*$', "", partial)                 # trailing comma
+        # Remove trailing commas before we close brackets
+        partial = re.sub(r",(\s*)$", r"\1", partial)
+
+        # Count unclosed openers
+        open_braces = partial.count("{") - partial.count("}")
+        open_brackets = partial.count("[") - partial.count("]")
+
+        # Close them in LIFO order (approximate — handles most real cases)
+        closers = "]" * max(open_brackets, 0) + "}" * max(open_braces, 0)
+        return partial + closers
 
     def resize_image(self, image: Image.Image) -> Image.Image:
         max_size = 1000
@@ -315,8 +339,14 @@ class HRExtractionService:
         return (
             "You are an HR screening extraction agent. Read the job description and return only valid JSON "
             f"matching this schema: {json.dumps(schema_json)}. "
-            "Infer must-have skills, nice-to-have skills, minimum experience, education, certifications, "
-            "domain keywords, and concise responsibilities. Use empty strings, 0, or empty arrays when information is absent.\n\n"
+            "Extract: (1) core must-have skills, (2) secondary good-to-have skills, (3) domain-specific capabilities, "
+            "(4) tools and technologies, and (5) behavioral or soft skills. "
+            "Include all skills explicitly mentioned or strongly implied by responsibilities and context. "
+            "Do not restrict extraction to predefined skill lists. "
+            "Map core skills to must_have_skills, secondary/tools/behavioral skills to good_to_have_skills, "
+            "and domain-specific capabilities to domain_keywords. "
+            "Infer minimum experience, education, certifications, and concise responsibilities. "
+            "Use empty strings, 0, or empty arrays when information is absent.\n\n"
             f"Job description:\n{text}"
         )
 
@@ -332,6 +362,9 @@ class HRExtractionService:
             f"this schema: {json.dumps(schema_json)}. "
             f"{source_instruction}"
             "Use section markers like [CONTACT_INFO], [SKILLS], [EXPERIENCE], [EDUCATION], and [PROJECTS] when present. "
+            "Extract all relevant skills including technical skills, tools, domain knowledge, soft skills, "
+            "and skills inferred from experience or projects. "
+            "Do not limit extraction to predefined categories or static skill lists. "
             "Prefer explicit evidence from the resume content. If a detail is clearly visible in the image but imperfect in OCR, still extract it. "
             "Use empty strings, 0, or empty arrays when information is absent.\n\n"
             f"Resume text:\n{text}"
@@ -359,13 +392,24 @@ class HRExtractionService:
         education_text = "\n".join(sections.get("education", []))
         certification_text = "\n".join(sections.get("certifications", []))
         responsibility_lines = sections.get("responsibilities", [])
+        responsibility_text = "\n".join(responsibility_lines)
 
-        must_have = self.extract_skills(required_text or text)
-        good_to_have = self.extract_skills(preferred_text)
+        must_have = self.extract_skills(required_text or f"{title}\n{responsibility_text}", limit=16)
+        if not must_have:
+            must_have = self.extract_skills(f"{title}\n{responsibility_text}", limit=12)
+
+        preferred_candidates = self.extract_skills(preferred_text, limit=14)
+        tool_candidates = self.extract_contextual_terms(text, TOOL_CONTEXT_MARKERS, limit=12)
+        soft_skill_candidates = self.extract_contextual_terms(text, SOFT_SKILL_MARKERS, limit=10)
+        good_to_have = self.merge_terms(
+            [preferred_candidates, tool_candidates, soft_skill_candidates],
+            exclude=set(must_have),
+            limit=20,
+        )
         domain_keywords = self.extract_domain_keywords(title, responsibility_lines, text)
 
         required_education = [token for token in KNOWN_EDUCATION if token in education_text.lower()]
-        required_certifications = self.extract_phrases(certification_text or "", 6)
+        required_certifications = self.extract_phrases(certification_text or "", limit=8, max_tokens=7)
 
         if not responsibility_lines:
             responsibility_lines = self.extract_bullets(text, limit=6)
@@ -412,11 +456,24 @@ class HRExtractionService:
                 break
 
         summary = " ".join(sections.get("SUMMARY", [])[:4]).strip()
-        skills = self.extract_skills("\n".join(sections.get("SKILLS", [])) or text)
-        tools = [skill for skill in skills if skill in {"aws", "azure", "gcp", "docker", "kubernetes", "terraform", "git", "linux"}]
+        skills_sources = [
+            "\n".join(sections.get("SKILLS", [])),
+            "\n".join(sections.get("EXPERIENCE", [])),
+            "\n".join(sections.get("PROJECTS", [])),
+            summary,
+        ]
+        merged_skill_source = "\n".join(part for part in skills_sources if part)
+        if not merged_skill_source.strip():
+            merged_skill_source = annotated_text
+        skills = self.extract_skills(merged_skill_source, limit=30)
+        if not skills:
+            skills = self.extract_skills(text, limit=20)
+        tools = self.extract_contextual_terms(merged_skill_source, TOOL_CONTEXT_MARKERS, limit=14)
+        if not tools:
+            tools = self.extract_skills("\n".join(sections.get("SKILLS", [])), limit=10)
         experience_entries = self.parse_experience_entries(sections.get("EXPERIENCE", []))
         education_entries = self.parse_education_entries(sections.get("EDUCATION", []))
-        certifications = self.extract_phrases("\n".join(sections.get("CERTIFICATIONS", [])), 10)
+        certifications = self.extract_phrases("\n".join(sections.get("CERTIFICATIONS", [])), limit=10, max_tokens=7)
         projects = self.extract_projects(sections.get("PROJECTS", []))
 
         metadata: dict[str, Any] = {}
@@ -481,12 +538,8 @@ class HRExtractionService:
             sections.setdefault(current, []).append(line.strip())
         return sections
 
-    def extract_skills(self, text: str) -> list[str]:
-        lowered = text.lower()
-        found = [skill for skill in KNOWN_SKILLS if skill in lowered]
-        if found:
-            return sorted({normalize_skill(skill) for skill in found})
-        return self.extract_phrases(text, limit=12)
+    def extract_skills(self, text: str, limit: int = 16) -> list[str]:
+        return self.extract_phrases(text, limit=limit, max_tokens=5)
 
     def extract_domain_keywords(self, title: str, responsibilities: list[str], text: str) -> list[str]:
         combined = f"{title}\n" + "\n".join(responsibilities) + "\n" + text
@@ -495,7 +548,12 @@ class HRExtractionService:
         seen: set[str] = set()
         for token in candidates:
             normalized = normalize_skill(token)
-            if not normalized or normalized in seen or normalized in KNOWN_SKILLS or normalized in {"years", "experience"}:
+            if (
+                not normalized
+                or normalized in seen
+                or normalized in DOMAIN_NOISE
+                or normalized in KNOWN_EDUCATION
+            ):
                 continue
             seen.add(normalized)
             result.append(normalized)
@@ -504,16 +562,27 @@ class HRExtractionService:
         return result
 
     def extract_bullets(self, text: str, limit: int) -> list[str]:
-        lines = [normalize_whitespace(line.lstrip("-*•")) for line in text.splitlines()]
+        lines = [normalize_whitespace(self.strip_bullet_prefix(line)) for line in text.splitlines()]
         bullets = [line for line in lines if line and len(line.split()) > 4]
         return bullets[:limit]
 
-    def extract_phrases(self, text: str, limit: int) -> list[str]:
+    def extract_phrases(
+        self,
+        text: str,
+        limit: int,
+        max_tokens: int = 6,
+        min_tokens: int = 1,
+    ) -> list[str]:
         items: list[str] = []
         seen: set[str] = set()
         for chunk in re.split(r"[\n,;/|]+", text):
             cleaned = normalize_skill(chunk)
-            if not cleaned or len(cleaned.split()) > 6 or cleaned in seen:
+            if not cleaned or cleaned in seen:
+                continue
+            tokens = cleaned.split()
+            if len(tokens) < min_tokens or len(tokens) > max_tokens:
+                continue
+            if cleaned in SKILL_NOISE or all(token in SKILL_NOISE for token in tokens):
                 continue
             seen.add(cleaned)
             items.append(cleaned)
@@ -521,17 +590,45 @@ class HRExtractionService:
                 break
         return items
 
+    def extract_contextual_terms(self, text: str, markers: tuple[str, ...], limit: int = 10) -> list[str]:
+        contextual_lines = [
+            normalize_whitespace(self.strip_bullet_prefix(line))
+            for line in text.splitlines()
+            if any(marker in line.lower() for marker in markers)
+        ]
+        if not contextual_lines:
+            return []
+        return self.extract_phrases("\n".join(contextual_lines), limit=limit, max_tokens=5)
+
+    def merge_terms(self, groups: list[list[str]], exclude: set[str] | None = None, limit: int = 20) -> list[str]:
+        excluded = {normalize_skill(item) for item in (exclude or set()) if normalize_skill(item)}
+        result: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for term in group:
+                normalized = normalize_skill(term)
+                if not normalized or normalized in excluded or normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append(normalized)
+                if len(result) >= limit:
+                    return result
+        return result
+
+    def strip_bullet_prefix(self, value: str) -> str:
+        return re.sub(r"^[\-\*\u2022\s]+", "", value)
+
     def parse_experience_entries(self, lines: list[str]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
 
         for line in lines:
-            cleaned = normalize_whitespace(line.lstrip("-*•"))
+            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
             if not cleaned:
                 continue
 
             date_match = re.search(
-                r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4}\s*(?:-|to|–)\s*(?:present|current|now|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4})",
+                r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4}\s*(?:-|to|\u2013)\s*(?:present|current|now|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4})",
                 cleaned,
             )
             delimiter_entry = "|" in cleaned or " at " in cleaned.lower()
@@ -578,7 +675,7 @@ class HRExtractionService:
         start_date = ""
         end_date = ""
         if date_range:
-            date_parts = re.split(r"(?i)\s*(?:-|to|–)\s*", date_range, maxsplit=1)
+            date_parts = re.split(r"(?i)\s*(?:-|to|\u2013)\s*", date_range, maxsplit=1)
             if len(date_parts) == 2:
                 start_date, end_date = date_parts
 
@@ -594,7 +691,7 @@ class HRExtractionService:
     def parse_education_entries(self, lines: list[str]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for line in lines:
-            cleaned = normalize_whitespace(line.lstrip("-*•"))
+            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
             if not cleaned:
                 continue
             graduation_match = re.search(r"\b(?:19|20)\d{2}\b", cleaned)
@@ -615,7 +712,8 @@ class HRExtractionService:
     def extract_projects(self, lines: list[str]) -> list[str]:
         projects: list[str] = []
         for line in lines:
-            cleaned = normalize_whitespace(line.lstrip("-*•"))
+            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
             if cleaned:
                 projects.append(cleaned)
         return projects[:10]
+
