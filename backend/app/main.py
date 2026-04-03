@@ -110,9 +110,15 @@ async def screen_resumes(
     results: list[ScreeningResult] = []
     failed_count = 0
 
+    # Limit concurrent threading to prevent OS memory exhaustion and thrashing.
+    # We allow 4 concurrent resumes to be processed in parallel. The VLM executes them sequentially via its internal lock,
+    # but the PDF parsing and API reasoning happens in parallel behind the queue.
+    semaphore = asyncio.Semaphore(4)
+
     async def process_single_resume(resume: UploadFile) -> ScreeningResult | Exception:
-        filename = resume.filename or "unnamed"
-        file_warnings: list[str] = []
+        async with semaphore:
+            filename = resume.filename or "unnamed"
+            file_warnings: list[str] = []
         try:
             content = await resume.read()
 
@@ -120,7 +126,7 @@ async def screen_resumes(
                 parsed = document_parser.parse_upload(filename, content)
                 file_warnings.extend(parsed.warnings)
 
-                resume_data = extraction_service.extract_resume(parsed.text)
+                resume_data = extraction_service.extract_resume(parsed.text, page_images=parsed.page_images)
                 resume_data = llm_service.enrich_candidate_persona(resume_data, job_summary)
                 
                 candidate_score = score_candidate(job_summary, resume_data)

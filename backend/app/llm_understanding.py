@@ -9,6 +9,11 @@ from app.schemas import JobDescriptionData, ResumeData
 logger = logging.getLogger(__name__)
 
 try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+try:
     import google.generativeai as genai
 except ImportError:
     genai = None
@@ -19,22 +24,42 @@ class LLMUnderstandingService:
     def __init__(self):
         self.settings = get_settings()
         self.enabled = False
-        if genai and self.settings.gemini_api_key:
+        self.provider = None
+
+        if self.settings.groq_api_key in str(self.settings.groq_api_key):
+            # Prioritize Groq if provided
+            key = self.settings.groq_api_key or "gsk_"
+            if Groq:
+                self.client = Groq(api_key=key)
+                self.provider = "groq"
+                self.enabled = True
+            else:
+                logger.warning("Groq key found, but groq library not installed.")
+        elif self.settings.gemini_api_key and genai:
             genai.configure(api_key=self.settings.gemini_api_key)
             self.model = genai.GenerativeModel("gemini-2.5-flash")
+            self.provider = "gemini"
             self.enabled = True
         else:
-            logger.warning("Gemini API key not found or google-generativeai not installed. LLM Understanding disabled.")
+            logger.warning("No LLM API keys found. LLM Understanding disabled.")
 
     def _generate_json(self, prompt: str, default: Any) -> Any:
         if not self.enabled:
             return default
         try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(response_mime_type="application/json")
-            )
-            return json.loads(response.text)
+            if self.provider == "groq":
+                response = self.client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"}
+                )
+                return json.loads(response.choices[0].message.content)
+            elif self.provider == "gemini":
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                )
+                return json.loads(response.text)
         except Exception as exc:
             logger.error("LLM Generation failed: %s", exc)
             return default

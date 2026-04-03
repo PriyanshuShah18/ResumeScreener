@@ -135,3 +135,4 @@ test_generation.py
 # Local LLM Caches
 skill_graph_cache.json
 backend/skill_graph_cache.json
+backend/test_image_upload.py

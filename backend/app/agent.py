@@ -257,11 +257,11 @@ class HRExtractionService:
                     padding=True,
                     return_tensors="pt",
                 ).to(self.device)
-                generated_ids = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False)
+                generated_ids = self.model.generate(**inputs, max_new_tokens=2500, do_sample=False)
         else:
             with self._inference_lock:
                 inputs = self.processor(text=[rendered_prompt], padding=True, return_tensors="pt").to(self.device)
-                generated_ids = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False)
+                generated_ids = self.model.generate(**inputs, max_new_tokens=2500, do_sample=False)
 
         trimmed_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
         decoded = self.processor.batch_decode(
@@ -336,6 +336,10 @@ class HRExtractionService:
 
     def job_description_prompt(self, text: str) -> str:
         schema_json = JobDescriptionData.model_json_schema()
+        # Hide LLM-only fields so the local VLM doesn't attempt to hallucinate them
+        for field in ("implicit_skills", "inferred_seniority", "domain_expectations"):
+            schema_json.get("properties", {}).pop(field, None)
+
         return (
             "You are an HR screening extraction agent. Read the job description and return only valid JSON "
             f"matching this schema: {json.dumps(schema_json)}. "
@@ -346,12 +350,18 @@ class HRExtractionService:
             "Map core skills to must_have_skills, secondary/tools/behavioral skills to good_to_have_skills, "
             "and domain-specific capabilities to domain_keywords. "
             "Infer minimum experience, education, certifications, and concise responsibilities. "
-            "Use empty strings, 0, or empty arrays when information is absent.\n\n"
+            "Return ONLY a strictly valid JSON map matching the specified schema. "
+            "Write EXTREMELY CONCISE summaries for responsibilities. Limit descriptions to a few keywords. "
+            "Never exceed 1000 characters of text.\n\n"
             f"Job description:\n{text}"
         )
 
     def resume_prompt(self, text: str, has_images: bool = False) -> str:
         schema_json = ResumeData.model_json_schema()
+        # Hide LLM-only fields so the local VLM doesn't attempt to hallucinate them
+        for field in ("skill_clusters", "enriched_persona"):
+            schema_json.get("properties", {}).pop(field, None)
+
         source_instruction = (
             "You are given a resume image and OCR text. OCR may be noisy or incomplete. Use the visible resume image as the primary source and use OCR text as supporting evidence. "
             if has_images
@@ -362,11 +372,14 @@ class HRExtractionService:
             f"this schema: {json.dumps(schema_json)}. "
             f"{source_instruction}"
             "Use section markers like [CONTACT_INFO], [SKILLS], [EXPERIENCE], [EDUCATION], and [PROJECTS] when present. "
+            "STRICT INSTRUCTION: Do NOT extract Education, Coursework, or personal Projects into the Experience section. If the candidate has no dedicated Work Experience section, leave experience_entries empty. "
             "Extract all relevant skills including technical skills, tools, domain knowledge, soft skills, "
             "and skills inferred from experience or projects. "
             "Do not limit extraction to predefined categories or static skill lists. "
             "Prefer explicit evidence from the resume content. If a detail is clearly visible in the image but imperfect in OCR, still extract it. "
-            "Use empty strings, 0, or empty arrays when information is absent.\n\n"
+            "Return ONLY a strictly valid JSON map matching the specified schema. "
+            "Write EXTREMELY CONCISE summaries for job experiences and projects. Do not copy-paste long paragraphs. "
+            "Limit descriptions to 1-2 ultra-short bullet points. Avoid markdown formatting blocks if possible.\n\n"
             f"Resume text:\n{text}"
         )
 
