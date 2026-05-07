@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,14 +44,18 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    if settings.preload_model_on_startup:
-        extraction_service.preload()
+    models = []
+    if llm_service.groq_client: models.append("Groq")
+    if llm_service.gemini_model: models.append("Gemini")
+    if llm_service.openrouter_key: models.append("OpenRouter")
+    if extraction_service._ollama_available: models.append("Ollama VLM")
+    logger.info(f"Backend started. Available extractors: {', '.join(models) if models else 'Heuristics only'}")
 
 
 @app.get("/")
 def root() -> dict[str, object]:
     return {
-        "message": "HR Resume Screening API",
+        "message": "HR Resume Screening API (Production)",
         "docs": "/docs",
         "health": "/health",
         "screen_resumes": "/screen-resumes",
@@ -61,8 +66,9 @@ def root() -> dict[str, object]:
 def health() -> dict[str, str | bool]:
     return {
         "status": "ok",
-        "model_loaded": extraction_service.model_available,
-        "model_error": extraction_service.load_error,
+        "ollama_connected": extraction_service._ollama_available,
+        "groq_enabled": llm_service.enabled,
+        "model_available": extraction_service.model_available,
     }
 
 
@@ -72,6 +78,8 @@ async def screen_resumes(
     resumes: list[UploadFile] = File(...),
     top_k: int = Form(5),
 ) -> ScreenResumesResponse:
+    batch_start = time.perf_counter()
+
     if not job_description.strip():
         raise HTTPException(status_code=400, detail="job_description cannot be empty")
     if not resumes:
@@ -92,72 +100,73 @@ async def screen_resumes(
         )
 
     warnings: list[str] = []
-    if extraction_service.load_error:
-        warnings.append(f"Model unavailable, using heuristic extraction: {extraction_service.load_error}")
+    if not extraction_service.model_available:
+        warnings.append("No AI model available (Ollama/Groq/Gemini). Using heuristic extraction only.")
 
+    # ── Step 1: Extract Job Description ──
     try:
+        jd_start = time.perf_counter()
         job_summary = extraction_service.extract_job_description(job_description)
-        job_summary = llm_service.enrich_jd_intelligence(job_summary)
+        logger.info("📋 JD extraction took %.1fs", time.perf_counter() - jd_start)
     except Exception as exc:
         logger.exception("Job description extraction failed")
         raise HTTPException(status_code=500, detail=f"Failed to parse job description: {exc}") from exc
 
-    if extraction_service.load_error:
-        model_warning = f"Model unavailable, using heuristic extraction: {extraction_service.load_error}"
-        if model_warning not in warnings:
-            warnings.append(model_warning)
+    # ── Step 2: Pre-read all file bytes (fast async I/O) ──
+    file_contents: list[tuple[str, bytes]] = []
+    for resume in resumes:
+        filename = resume.filename or "unnamed"
+        content = await resume.read()
+        file_contents.append((filename, content))
 
+    # ── Step 3: Process resumes with STAGGERED launch ──
+    # We launch one resume every 0.5s to prevent "burst" rate limits (429s).
+    semaphore = asyncio.Semaphore(8)
     results: list[ScreeningResult] = []
     failed_count = 0
 
-    # Limit concurrent threading to prevent OS memory exhaustion and thrashing.
-    # We allow 4 concurrent resumes to be processed in parallel. The VLM executes them sequentially via its internal lock,
-    # but the PDF parsing and API reasoning happens in parallel behind the queue.
-    semaphore = asyncio.Semaphore(4)
-
-    async def process_single_resume(resume: UploadFile) -> ScreeningResult | Exception:
+    async def process_single_resume(filename: str, content: bytes) -> ScreeningResult | Exception:
         async with semaphore:
-            filename = resume.filename or "unnamed"
-            file_warnings: list[str] = []
-        try:
-            content = await resume.read()
+            try:
+                def _sync_process() -> ScreeningResult:
+                    resume_start = time.perf_counter()
+                    file_warnings: list[str] = []
+                    parsed = document_parser.parse_upload(filename, content)
+                    file_warnings.extend(parsed.warnings)
+                    resume_data = extraction_service.extract_resume(parsed.text, page_images=parsed.page_images)
+                    candidate_score = score_candidate(job_summary, resume_data)
+                    reasoning_output = generate_reasoning(job_summary, resume_data, candidate_score, extraction_service)
+                    recruiter_feedback = build_recruiter_feedback(
+                        job_summary,
+                        resume_data,
+                        candidate_score,
+                        reasoning_summary=reasoning_output.fit_rationale,
+                    )
+                    logger.info("📄 %s processed in %.1fs", filename, time.perf_counter() - resume_start)
+                    return ScreeningResult(
+                        source_file=filename,
+                        resume_data=resume_data,
+                        score=candidate_score,
+                        recruiter_feedback=recruiter_feedback,
+                        hiring_decision=reasoning_output.hiring_decision,
+                        interview_focus_areas=reasoning_output.interview_focus_areas,
+                        hidden_strengths=reasoning_output.hidden_strengths,
+                        warnings=file_warnings,
+                    )
+                return await asyncio.to_thread(_sync_process)
+            except Exception as exc:
+                logger.exception("Resume processing failed for %s", filename)
+                return exc
 
-            def _sync_process() -> ScreeningResult:
-                parsed = document_parser.parse_upload(filename, content)
-                file_warnings.extend(parsed.warnings)
+    # Launch tasks with a 0.3s gap between each to respect RPM limits
+    tasks = []
+    for filename, content in file_contents:
+        tasks.append(asyncio.create_task(process_single_resume(filename, content)))
+        await asyncio.sleep(0.3)  # Fast staggered launch ⚡
 
-                resume_data = extraction_service.extract_resume(parsed.text, page_images=parsed.page_images)
-                resume_data = llm_service.enrich_candidate_persona(resume_data, job_summary)
-                
-                candidate_score = score_candidate(job_summary, resume_data)
-                reasoning_output = generate_reasoning(job_summary, resume_data, candidate_score, extraction_service)
-                recruiter_feedback = build_recruiter_feedback(
-                    job_summary,
-                    resume_data,
-                    candidate_score,
-                    reasoning_summary=reasoning_output.fit_rationale,
-                )
+    outcomes = await asyncio.gather(*tasks)
 
-                return ScreeningResult(
-                    source_file=filename,
-                    resume_data=resume_data,
-                    score=candidate_score,
-                    recruiter_feedback=recruiter_feedback,
-                    hiring_decision=reasoning_output.hiring_decision,
-                    interview_focus_areas=reasoning_output.interview_focus_areas,
-                    hidden_strengths=reasoning_output.hidden_strengths,
-                    warnings=file_warnings,
-                )
-
-            return await asyncio.to_thread(_sync_process)
-        except Exception as exc:
-            logger.exception("Resume processing failed for %s", filename)
-            return exc
-
-    outcomes = await asyncio.gather(*(process_single_resume(resume) for resume in resumes))
-
-    for resume, outcome in zip(resumes, outcomes):
-        filename = resume.filename or "unnamed"
+    for (filename, _), outcome in zip(file_contents, outcomes):
         if isinstance(outcome, Exception):
             failed_count += 1
             warnings.append(f"{filename}: {outcome}")
@@ -167,6 +176,15 @@ async def screen_resumes(
 
     results = rank_results(results)
     capped_top_k = min(top_k, len(results))
+
+    total_elapsed = time.perf_counter() - batch_start
+    logger.info(
+        "🏁 Batch complete: %d/%d resumes in %.1fs (%.1fs/resume avg)",
+        len(results),
+        len(file_contents),
+        total_elapsed,
+        total_elapsed / max(len(file_contents), 1),
+    )
 
     return ScreenResumesResponse(
         job_summary=job_summary,

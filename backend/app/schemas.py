@@ -165,9 +165,6 @@ class JobDescriptionData(BaseModel):
     required_certifications: list[str] = Field(default_factory=list, description="Required or preferred certifications")
     domain_keywords: list[str] = Field(default_factory=list, description="Domain or business context keywords")
     responsibilities: list[str] = Field(default_factory=list, description="Key responsibilities from the JD")
-    implicit_skills: list[str] = Field(default_factory=list, description="Implicit skills inferred by LLM")
-    inferred_seniority: str = Field(default="", description="Seniority level inferred by LLM")
-    domain_expectations: list[str] = Field(default_factory=list, description="Domain expectations extracted by LLM")
 
     @field_validator("title", mode="before")
     @classmethod
@@ -180,8 +177,6 @@ class JobDescriptionData(BaseModel):
         "required_education",
         "required_certifications",
         "domain_keywords",
-        "implicit_skills",
-        "domain_expectations",
         mode="before",
     )
     @classmethod
@@ -242,8 +237,6 @@ class ResumeData(BaseModel):
     projects: list[str] = Field(default_factory=list, description="Project highlights")
     total_years_experience: float = Field(default=0.0, ge=0, description="Total inferred years of experience")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Extra structured metadata captured during parsing")
-    enriched_persona: list[str] = Field(default_factory=list, description="Persona enrichment from LLM")
-    skill_clusters: dict[str, list[str]] = Field(default_factory=dict, description="Skill graph relationships mapped by LLM")
 
     @field_validator("name", "location", "summary", "linkedin", "portfolio", mode="before")
     @classmethod

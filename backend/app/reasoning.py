@@ -87,7 +87,7 @@ def generate_reasoning(
         return fallback_reasoning(job, resume, score)
 
     prompt = build_reasoning_prompt(job, resume, score)
-    result = llm_service._generate_json(prompt, {})
+    result, _ = llm_service._generate_json(prompt, {})
     
     if not result:
         return fallback_reasoning(job, resume, score)

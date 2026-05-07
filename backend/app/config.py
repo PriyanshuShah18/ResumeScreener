@@ -25,6 +25,7 @@ def _get_int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Settings:
     model_id: str
+    ollama_base_url: str
     tesseract_cmd: str | None
     poppler_path: str | None
     max_resumes_per_request: int
@@ -34,24 +35,29 @@ class Settings:
     preload_model_on_startup: bool
     gemini_api_key: str | None
     groq_api_key: str | None
+    openrouter_api_key: str | None
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings(
-        model_id=os.getenv("MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct"),
+    settings = Settings(
+        model_id=os.getenv("MODEL_ID", "qwen2.5vl:3b"),
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         tesseract_cmd=os.getenv("TESSERACT_CMD"),
         poppler_path=os.getenv("POPPLER_PATH", r"D:\Work\Poppler\poppler-25.12.0\Library\bin"),
-        max_resumes_per_request=_get_int("MAX_RESUMES_PER_REQUEST", 10),
+        max_resumes_per_request=_get_int("MAX_RESUMES_PER_REQUEST", 100),
         max_pages_per_resume=_get_int("MAX_PAGES_PER_RESUME", 5),
         max_file_size_mb=_get_int("MAX_FILE_SIZE_MB", 10),
         min_pdf_text_chars=_get_int("MIN_PDF_TEXT_CHARS", 300),
         preload_model_on_startup=_get_bool("PRELOAD_MODEL_ON_STARTUP", True),
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
         groq_api_key=os.getenv("GROQ_API_KEY"),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
-    if not settings.groq_api_key and not settings.gemini_api_key:
-        print("Warning : No LLM API Keys configured")
+    if not settings.groq_api_key and not settings.gemini_api_key and not settings.openrouter_api_key:
+        # Using print for console visibility during startup
+        print("Warning: No LLM API Keys configured (Groq/Gemini/OpenRouter). Enrichment features will be disabled.")
 
     return settings
+
