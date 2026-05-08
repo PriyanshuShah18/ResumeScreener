@@ -11,6 +11,12 @@ from typing import Any
 from app.constants import SKILL_ALIASES
 from app.schemas import normalize_skill
 
+try:
+    from sentence_transformers import SentenceTransformer, util
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
 
 
 def canonicalize_skill(value: str) -> str:
@@ -64,7 +70,7 @@ class SemanticMatcher:
         model_name: str = "all-MiniLM-L6-v2",
         semantic_threshold: float = 0.75,
         partial_threshold: float = 0.60,
-        required_match_threshold: float = 0.70,
+        required_match_threshold: float = 0.88,
         additional_relevance_threshold: float = 0.60,
         clustering_threshold: float = 0.78,
         domain_bonus_max: int = 8,
@@ -77,6 +83,25 @@ class SemanticMatcher:
         self.additional_relevance_threshold = additional_relevance_threshold
         self.clustering_threshold = clustering_threshold
         self.domain_bonus_max = max(domain_bonus_max, 0)
+        
+        self._model = None
+        self._model_lock = threading.Lock()
+        self._embedding_cache: dict[str, Any] = {}
+        self._cache_max = 512
+        self.enable_model = enable_model and _HAS_TRANSFORMERS
+
+    @property
+    def model(self):
+        if not self.enable_model:
+            return None
+        with self._model_lock:
+            if self._model is None:
+                try:
+                    self._model = SentenceTransformer(self.model_name)
+                except Exception as e:
+                    print(f"Failed to load semantic model {self.model_name}: {e}")
+                    self.enable_model = False
+            return self._model
 
 
     def _normalize_terms(self, values: list[str], canonicalize: bool = True) -> list[str]:
@@ -114,6 +139,15 @@ class SemanticMatcher:
         required_threshold = self.required_match_threshold if threshold is None else threshold
         normalized_jd = self._normalize_terms(jd_skills)
         normalized_resume = self._normalize_terms(resume_skills)
+
+        # Dynamically populate the skill graph cache for any unseen skills
+        all_skills = list(set(normalized_jd + normalized_resume))
+        if all_skills:
+            from app.llm_understanding import llm_service
+            try:
+                llm_service.generate_skill_graph(all_skills)
+            except Exception as e:
+                print(f"Failed to populate skill graph: {e}")
 
         matched: list[str] = []
         missing: list[str] = []
@@ -268,20 +302,41 @@ class SemanticMatcher:
         if left_norm == right_norm:
             return 1.0
 
+        # Fallback 1: Lexical exact-string overlaps (instant)
+        lexical_score = lexical_similarity(left_norm, right_norm)
+        if lexical_score >= 0.95:
+            return lexical_score
+
         # Primary Intelligence: Check Gemini LLM dynamic skill graph
         from app.llm_understanding import llm_service
         try:
             llm_cache = llm_service._load_cache()
-            # If the LLM has already mapped these skills hierarchically, return a perfect semantic match!
             if left_norm in llm_cache and right_norm in [s.lower() for s in llm_cache[left_norm]]:
-                return 1.0
+                return 0.85
             if right_norm in llm_cache and left_norm in [s.lower() for s in llm_cache[right_norm]]:
-                return 1.0
+                return 0.85
         except Exception:
             pass
 
-        # Fallback 1: Lexical exact-string overlaps
-        lexical_score = lexical_similarity(left_norm, right_norm)
+        # Fallback 2: Sentence-BERT Embeddings (with cache)
+        if self.enable_model and self.model:
+            try:
+                def _get_cached_embedding(text):
+                    if text in self._embedding_cache:
+                        return self._embedding_cache[text]
+                    emb = self.model.encode(text, convert_to_tensor=True, show_progress_bar=False)
+                    if len(self._embedding_cache) < self._cache_max:
+                        self._embedding_cache[text] = emb
+                    return emb
+
+                emb_left = _get_cached_embedding(left_norm)
+                emb_right = _get_cached_embedding(right_norm)
+                from sentence_transformers import util
+                semantic_score = float(util.cos_sim(emb_left, emb_right)[0][0])
+                return max(lexical_score, semantic_score)
+            except Exception:
+                pass
+
         return lexical_score
 
 
@@ -320,7 +375,7 @@ def get_semantic_matcher() -> SemanticMatcher:
         model_name=os.getenv("SEMANTIC_MODEL_NAME", "all-MiniLM-L6-v2"),
         semantic_threshold=_get_float_env("SEMANTIC_THRESHOLD", 0.75),
         partial_threshold=_get_float_env("SEMANTIC_PARTIAL_THRESHOLD", 0.60),
-        required_match_threshold=_get_float_env("SEMANTIC_REQUIRED_THRESHOLD", 0.70),
+        required_match_threshold=_get_float_env("SEMANTIC_REQUIRED_THRESHOLD", 0.88),
         additional_relevance_threshold=_get_float_env("SEMANTIC_ADDITIONAL_THRESHOLD", 0.60),
         clustering_threshold=_get_float_env("SEMANTIC_CLUSTER_THRESHOLD", 0.78),
         domain_bonus_max=_get_int_env("SEMANTIC_DOMAIN_BONUS_MAX", 8),

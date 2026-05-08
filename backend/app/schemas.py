@@ -165,9 +165,7 @@ class JobDescriptionData(BaseModel):
     required_certifications: list[str] = Field(default_factory=list, description="Required or preferred certifications")
     domain_keywords: list[str] = Field(default_factory=list, description="Domain or business context keywords")
     responsibilities: list[str] = Field(default_factory=list, description="Key responsibilities from the JD")
-    implicit_skills: list[str] = Field(default_factory=list, description="Implicit skills inferred by LLM")
-    inferred_seniority: str = Field(default="", description="Seniority level inferred by LLM")
-    domain_expectations: list[str] = Field(default_factory=list, description="Domain expectations extracted by LLM")
+    archetype: str = Field(default="standard", description="Role archetype (e.g. management, research, analyst, finance, senior, data_ml, product, standard)")
 
     @field_validator("title", mode="before")
     @classmethod
@@ -180,8 +178,6 @@ class JobDescriptionData(BaseModel):
         "required_education",
         "required_certifications",
         "domain_keywords",
-        "implicit_skills",
-        "domain_expectations",
         mode="before",
     )
     @classmethod
@@ -242,8 +238,6 @@ class ResumeData(BaseModel):
     projects: list[str] = Field(default_factory=list, description="Project highlights")
     total_years_experience: float = Field(default=0.0, ge=0, description="Total inferred years of experience")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Extra structured metadata captured during parsing")
-    enriched_persona: list[str] = Field(default_factory=list, description="Persona enrichment from LLM")
-    skill_clusters: dict[str, list[str]] = Field(default_factory=dict, description="Skill graph relationships mapped by LLM")
 
     @field_validator("name", "location", "summary", "linkedin", "portfolio", mode="before")
     @classmethod
@@ -291,13 +285,13 @@ class ResumeData(BaseModel):
         edu_inst_kw = {"institute", "university", "college", "school", "academy"}
         work_kw = {
             "assistant", "researcher", "professor", "lecturer", "intern", 
-            "developer", "engineer", "manager", "lead", "coordinator", 
-            "tutor", "instructor", "faculty", "staff", "postdoc", "fellow", 
-            "consultant", "freelance", "freelancer", "founder", "mentor",
-            "creator", "writer", "designer", "editor", "analyst",
-            "specialist", "executive", "administrator", "scientist", 
-            "architect", "technician", "associate", "expert", "officer",
-            "director", "head", "principal", "president", "vp"
+            "developer", "dev", "engineer", "software", "fullstack", "frontend", "backend",
+            "manager", "lead", "coordinator", "tutor", "instructor", "faculty", 
+            "staff", "postdoc", "fellow", "consultant", "freelance", "freelancer", 
+            "founder", "mentor", "creator", "writer", "designer", "editor", "analyst",
+            "specialist", "executive", "administrator", "scientist", "architect", 
+            "technician", "associate", "expert", "officer", "director", "head", 
+            "principal", "president", "vp", "ui", "ux"
         }
 
         for entry in value:
@@ -387,11 +381,12 @@ class ResumeData(BaseModel):
 
 class CandidateScore(BaseModel):
     total_score: int = Field(default=0, ge=0, le=100)
-    skills_score: int = Field(default=0, ge=0, le=40)
-    experience_score: int = Field(default=0, ge=0, le=35)
-    education_score: int = Field(default=0, ge=0, le=25)
-    keyword_score: int = Field(default=0, ge=0, le=10)
-    completeness_score: int = Field(default=0, ge=0, le=5)
+    skills_score: int = Field(default=0, ge=0)
+    experience_score: int = Field(default=0, ge=0)
+    education_score: int = Field(default=0, ge=0)
+    keyword_score: int = Field(default=0, ge=0)
+    completeness_score: int = Field(default=0, ge=0)
+    budgets: dict[str, int] = Field(default_factory=dict)
     confidence_score: int = Field(default=0, ge=0, le=100)
     risk_score: int = Field(default=0, ge=0, le=100)
     matched_skills: list[str] = Field(default_factory=list)

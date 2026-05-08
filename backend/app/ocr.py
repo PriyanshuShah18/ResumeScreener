@@ -5,7 +5,6 @@ from typing import Iterable
 
 try:
     import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 except ImportError:  # pragma: no cover
     pytesseract = None
 from app.config import get_settings
@@ -17,16 +16,22 @@ class OCRUnavailableError(RuntimeError):
 
 
 def _configure_tesseract() -> None:
+    """Configure tesseract binary path from environment settings."""
     settings = get_settings()
     if pytesseract and settings.tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+
+
+# Configure once at module load instead of per-call
+if pytesseract:
+    _configure_tesseract()
 
 
 def extract_with_boxes(image) -> str:
     if not pytesseract:
         raise OCRUnavailableError("pytesseract is not installed")
 
-    _configure_tesseract()
+    # Tesseract is configured once at module load (see above)
     not_found_error = getattr(pytesseract, "TesseractNotFoundError", None)
     if not not_found_error and hasattr(pytesseract, "pytesseract"):
         not_found_error = getattr(pytesseract.pytesseract, "TesseractNotFoundError", None)

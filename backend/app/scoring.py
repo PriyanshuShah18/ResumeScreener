@@ -6,9 +6,8 @@ from typing import Any
 
 from app.constants import (
     SCORING_SKILL_NOISE as SKILL_NOISE,
+    SCORING_CONFIG,
     SENIORITY_MAP,
-    SENIOR_ROLE_TOKENS,
-    RESEARCH_ROLE_TOKENS,
     STOPWORDS,
 )
 from app.schemas import (
@@ -28,6 +27,51 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 def normalize_set(values: list[str]) -> set[str]:
     normalized = {canonicalize_skill(value) for value in values if canonicalize_skill(value)}
     return {value for value in normalized if value and value not in SKILL_NOISE}
+
+
+# ─── Impact Signal Extraction (reporting only, not scored) ──────────────────
+
+IMPACT_PATTERNS = [
+    re.compile(r"\b(\d+(?:\.\d+)?)\s*%\s*(?:reduction|increase|improvement|decrease|faster|growth)", re.IGNORECASE),
+    re.compile(r"\b(?:reduced|improved|increased|decreased|optimized)\b.{0,60}\b\d+", re.IGNORECASE),
+    re.compile(r"\b(?:served|handling|processed|supporting)\b.{0,40}\b(\d[\d,]*)\s*(?:users|requests|events|transactions)", re.IGNORECASE),
+]
+OWNERSHIP_VERBS = {"led", "designed", "architected", "owned", "built", "launched", "shipped", "drove", "founded", "created", "established", "defined"}
+CONTRIBUTOR_VERBS = {"worked", "assisted", "helped", "supported", "contributed", "participated"}
+
+
+def extract_impact_signals(highlights: list[str]) -> dict:
+    """Extract quantified impact presence from resume highlights."""
+    quantified_count = 0
+    for highlight in highlights:
+        for pattern in IMPACT_PATTERNS:
+            if pattern.search(highlight):
+                quantified_count += 1
+                break
+    return {
+        "quantified_bullets": quantified_count,
+        "total_bullets": len(highlights),
+        "quantification_rate": quantified_count / max(len(highlights), 1),
+    }
+
+
+def ownership_ratio(highlights: list[str]) -> float:
+    """Measure ownership vs contributor language in resume highlights."""
+    ownership_count = 0
+    contributor_count = 0
+    for highlight in highlights:
+        words = highlight.strip().lower().split()
+        if not words:
+            continue
+        first_word = words[0].rstrip("ed,.:;")
+        if first_word in OWNERSHIP_VERBS or any(first_word.startswith(v) for v in OWNERSHIP_VERBS):
+            ownership_count += 1
+        elif first_word in CONTRIBUTOR_VERBS or any(first_word.startswith(v) for v in CONTRIBUTOR_VERBS):
+            contributor_count += 1
+    total = ownership_count + contributor_count
+    if total == 0:
+        return 0.5  # neutral
+    return ownership_count / total
 
 
 def extract_phrases(value: str, limit: int = 15) -> list[str]:
@@ -75,19 +119,20 @@ def candidate_skill_evidence(resume: ResumeData) -> dict[str, float]:
             previous = evidence.get(canonical, 0.0)
             evidence[canonical] = min(1.0, previous + weight)
 
-    add_terms(resume.skills, 0.4)
-    add_terms(resume.tools, 0.4)
-    add_terms(resume.certifications, 0.4)
+    add_terms(resume.skills, 0.6)
+    add_terms(resume.tools, 0.6)
+    add_terms(resume.certifications, 0.6)
 
     ordered_entries = sorted_experience_entries(resume)
+    decay = SCORING_CONFIG["skill_evidence_decay"]
     for idx, entry in enumerate(reversed(ordered_entries)):
-        decay_factor = 0.85 ** idx
-        add_terms(entry.skills_used, 0.75 * decay_factor)
-        add_terms(extract_phrases("\n".join(entry.highlights), limit=12), 0.60 * decay_factor)
+        decay_factor = decay ** idx
+        add_terms(entry.skills_used, SCORING_CONFIG["skill_listed_weight"] * decay_factor)
+        add_terms(extract_phrases("\n".join(entry.highlights), limit=12), SCORING_CONFIG["skill_highlight_weight"] * decay_factor)
 
     for idx, project in enumerate(resume.projects):
-        decay_factor = 0.85 ** idx
-        add_terms(extract_phrases(project, limit=8), 0.50 * decay_factor)
+        decay_factor = decay ** idx
+        add_terms(extract_phrases(project, limit=8), SCORING_CONFIG["skill_project_weight"] * decay_factor)
 
     return evidence
 
@@ -156,11 +201,16 @@ def progression_score(resume: ResumeData) -> float:
     if not levels:
         return 0.0
     if len(levels) == 1:
-        return 0.6
+        # Scale by seniority: Intern(1)→0.52, Senior(4)→0.88, Staff(5)→1.0
+        return clamp(0.4 + (levels[0] / 5.0) * 0.6, 0.0, 1.0)
 
     non_decreasing = sum(1 for i in range(1, len(levels)) if levels[i] >= levels[i - 1]) / (len(levels) - 1)
     upward_gain = max(levels[-1] - levels[0], 0) / 5.0
-    return clamp(0.65 * non_decreasing + 0.35 * upward_gain, 0.0, 1.0)
+    return clamp(
+        SCORING_CONFIG["progression_non_decreasing_weight"] * non_decreasing +
+        SCORING_CONFIG["progression_upward_gain_weight"] * upward_gain,
+        0.0, 1.0,
+    )
 
 
 def experience_domain_terms(resume: ResumeData) -> list[str]:
@@ -198,11 +248,21 @@ def education_ratio(job: JobDescriptionData, resume: ResumeData, matcher: Semant
 
 
 def score_budget(job: JobDescriptionData) -> dict[str, int]:
-    tokens = set(re.findall(r"[a-z]+", f"{job.title} {' '.join(job.responsibilities)}".lower()))
-    if tokens & RESEARCH_ROLE_TOKENS:
+    archetype = job.archetype.lower()
+    if "research" in archetype:
         return {"skills": 32, "experience": 28, "education": 25, "keyword": 10, "completeness": 5}
-    if tokens & SENIOR_ROLE_TOKENS:
-        return {"skills": 35, "experience": 35, "education": 15, "keyword": 10, "completeness": 5}
+    if "management" in archetype:
+        return {"skills": 20, "experience": 35, "education": 15, "keyword": 15, "completeness": 15}
+    if "data_ml" in archetype:
+        return {"skills": 35, "experience": 25, "education": 22, "keyword": 13, "completeness": 5}
+    if "product" in archetype:
+        return {"skills": 20, "experience": 30, "education": 15, "keyword": 20, "completeness": 15}
+    if "senior" in archetype:
+        return {"skills": 35, "experience": 35, "education": 10, "keyword": 10, "completeness": 10}
+    if "analyst" in archetype:
+        return {"skills": 30, "experience": 25, "education": 15, "keyword": 20, "completeness": 10}
+    if "finance" in archetype:
+        return {"skills": 25, "experience": 30, "education": 25, "keyword": 15, "completeness": 5}
     return {"skills": 40, "experience": 30, "education": 15, "keyword": 10, "completeness": 5}
 
 
@@ -284,6 +344,12 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     required_coverage = math.sqrt(required_credit / len(required_skills)) if required_skills else 1.0
     preferred_coverage = math.sqrt(preferred_credit / len(preferred_skills)) if preferred_skills else 1.0
 
+    # Breadth Scaling: A single match shouldn't give 100% credit for the entire domain
+    breadth_min = SCORING_CONFIG["breadth_min_skills"]
+    breadth_floor = SCORING_CONFIG["breadth_floor"]
+    breadth_factor = clamp(len(required_skills) / breadth_min, breadth_floor, 1.0) if required_skills else 1.0
+    required_coverage *= breadth_factor
+
     if required_skills and preferred_skills:
         skill_ratio = clamp((3 * required_coverage + preferred_coverage) / 4, 0.0, 1.0)
     elif required_skills:
@@ -362,7 +428,6 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     completeness_fields = [
         bool(resume.name),
         bool(resume.email),
-        bool(resume.phone),
         bool(resume.summary),
         bool(resume.skills),
         bool(resume.experience_entries),
@@ -372,31 +437,32 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     completeness_ratio = sum(completeness_fields) / len(completeness_fields)
     completeness_score = round(budgets["completeness"] * completeness_ratio)
 
-    total_score = (
+    # Compute base score from core dimensions (without bonuses)
+    base_score = (
         skills_score
         + experience_score
         + education_score
         + keyword_score
         + completeness_score
-        + additional_skills_bonus_score
-        + domain_bonus_score
     )
-    
+
+    # Apply penalty caps to base score BEFORE adding bonuses
+    # This prevents bonus points from masking fundamental skill gaps
     if required_skills and not matched_required:
-        total_score = min(total_score, 45)
+        base_score = min(base_score, 40)
     elif critical_missing:
-        total_score = min(total_score, 60)
-        
-    total_score = min(total_score, 100)
+        base_score = min(base_score, 65)
+
+    total_score = min(base_score + additional_skills_bonus_score + domain_bonus_score, 100)
 
     confidence_score = round(
         clamp(
             (
-                0.30 * skill_ratio
+                0.40 * skill_ratio
                 + 0.30 * completeness_ratio
-                + 0.20 * min(len(candidate_skills) / 20, 1.0)
+                + 0.15 * min(len(candidate_skills) / 12, 1.0)
                 + 0.10 * min(len(additional_relevant_skills) / 5, 1.0)
-                + 0.10 * domain_alignment
+                + 0.05 * domain_alignment
             )
             * 100,
             0,
@@ -447,6 +513,20 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     if domain_alignment < 0.4:
         risks.append("Domain evidence in experience appears limited")
 
+    # Impact signal analysis (reporting only — does not affect numerical score)
+    all_highlights = [h for e in resume.experience_entries for h in e.highlights]
+    if all_highlights:
+        impact = extract_impact_signals(all_highlights)
+        ownership = ownership_ratio(all_highlights)
+        if impact["quantification_rate"] >= 0.3:
+            strengths.append(f"Strong quantified impact: {impact['quantified_bullets']}/{impact['total_bullets']} bullets have measurable outcomes")
+        elif impact["total_bullets"] > 3 and impact["quantification_rate"] < 0.1:
+            risks.append("Experience highlights lack quantified outcomes — probe for measurable impact in interview")
+        if ownership >= 0.6:
+            strengths.append("High ownership language — candidate demonstrates leadership in execution")
+        elif ownership <= 0.2:
+            risks.append("Contributor-heavy language — may not have driven outcomes independently")
+
     semantic_details = {
         "required": required_details,
         "preferred": preferred_details,
@@ -475,6 +555,7 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         education_score=education_score,
         keyword_score=keyword_score,
         completeness_score=completeness_score,
+        budgets=budgets,
         confidence_score=confidence_score,
         risk_score=risk_score,
         matched_skills=matched_required,

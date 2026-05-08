@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import re
+import base64
+import io
+import time
 from typing import Any
 
+import requests
 from PIL import Image
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.constants import (
     EXTRACTION_DOMAIN_NOISE as DOMAIN_NOISE,
     EXTRACTION_SKILL_NOISE as SKILL_NOISE,
@@ -19,64 +22,50 @@ from app.constants import (
 )
 from app.ocr import annotate_resume_sections
 from app.schemas import JobDescriptionData, ResumeData, normalize_skill, normalize_whitespace
-
 from app.llm_understanding import llm_service
-
-try:
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-except ImportError:  # pragma: no cover
-    AutoProcessor = None
-    Qwen2VLForConditionalGeneration = None
-
-try:
-    from qwen_vl_utils import process_vision_info
-except ImportError:  # pragma: no cover
-    process_vision_info = None
-
-try:
-    import torch
-except ImportError:  # pragma: no cover
-    torch = None
 
 logger = logging.getLogger(__name__)
 
+
+def scrub_pii(text: str) -> str:
+    """Replace PII (email, phone) with placeholders for external LLM calls."""
+    text = re.sub(r'\b[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', text)
+    text = re.sub(r'(?:\+?\d[\d\s\-\(\)]{8,14}\d)', '[PHONE]', text)
+    return text
+
+
 class HRExtractionService:
+    """Production-optimized extraction service.
+
+    Routing strategy:
+      - Text-rich documents (≥300 chars) → heuristic regex + Groq/Gemini LLM (fast, ~3-8s)
+      - Image-only documents (scanned PDFs) → Ollama VLM (slower, ~30-90s)
+
+    This avoids the Ollama single-request bottleneck for the common case.
+    """
+
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.model = None
-        self.processor = None
         self.load_error = ""
-        self.device = "cuda" if torch and torch.cuda.is_available() else "cpu"
-        self._inference_lock = threading.Lock()
+        self._ollama_available = False
+        # Check connectivity to Ollama on init
+        try:
+            resp = requests.get(f"{self.settings.ollama_base_url}/api/tags", timeout=2)
+            if resp.ok:
+                self._ollama_available = True
+        except Exception:
+            logger.warning("Ollama not reachable at %s — VLM extraction disabled", self.settings.ollama_base_url)
 
     @property
     def model_available(self) -> bool:
-        return self.model is not None and self.processor is not None
+        return self._ollama_available or llm_service.enabled
 
     def preload(self) -> None:
-        try:
-            self._load_model()
-        except Exception as exc:  # pragma: no cover
-            self.load_error = str(exc)
-            logger.warning("Model preload failed, heuristic extraction will be used: %s", exc)
+        pass  # Ollama loads on first request
 
-    def _load_model(self) -> None:
-        if self.model_available:
-            return
-        if not AutoProcessor or not Qwen2VLForConditionalGeneration or not torch:
-            raise RuntimeError("transformers/torch dependencies are unavailable")
+    # ─── Public Extraction API ───────────────────────────────────────────
 
-        logger.info("Loading HR extraction model %s on %s", self.settings.model_id, self.device)
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.settings.model_id, 
-            dtype=dtype,
-            attn_implementation="sdpa"
-        )
-        self.model.to(self.device)
-        self.processor = AutoProcessor.from_pretrained(self.settings.model_id)
-
-    def extract_job_description(self, text: str, max_retries: int = 2) -> JobDescriptionData:
+    def extract_job_description(self, text: str, max_retries: int = 1) -> JobDescriptionData:
         return self._extract_structured_output(
             input_text=text,
             schema_cls=JobDescriptionData,
@@ -85,7 +74,12 @@ class HRExtractionService:
             max_retries=max_retries,
         )
 
-    def extract_resume(self, document_text: str, page_images: list[Image.Image] | None = None, max_retries: int = 2) -> ResumeData:
+    def extract_resume(
+        self,
+        document_text: str,
+        page_images: list[Image.Image] | None = None,
+        max_retries: int = 1,
+    ) -> ResumeData:
         annotated_text = annotate_resume_sections(document_text)
         return self._extract_structured_output(
             input_text=annotated_text,
@@ -96,6 +90,8 @@ class HRExtractionService:
             max_retries=max_retries,
         )
 
+    # ─── Core Extraction Logic ───────────────────────────────────────────
+
     def _extract_structured_output(
         self,
         input_text: str,
@@ -103,290 +99,252 @@ class HRExtractionService:
         prompt: str,
         heuristic,
         page_images: list[Image.Image] | None = None,
-        max_retries: int = 2,
+        max_retries: int = 1,
     ):
-        page_images = page_images or []
-        if not input_text.strip() and not page_images:
+        has_text = len(input_text.strip()) >= 5
+        has_images = bool(page_images)
+
+        if not has_text and not has_images:
             return schema_cls()
 
-        if not input_text.strip() and page_images and not self.model_available:
-            raise RuntimeError(
-                "OCR text is unavailable and the vision model is not loaded. Install/configure Tesseract or enable the model."
-            )
+        t0 = time.perf_counter()
 
-        if not self.model_available:
-            if not self.load_error:
-                self.load_error = "Model not loaded"
-            return schema_cls(**heuristic(input_text))
+        # ── FAST PATH: Text-rich documents → Heuristic + Groq/Gemini ──
+        if has_text:
+            # Step 1: Always run the fast heuristic (< 10ms)
+            heuristic_data = heuristic(input_text)
 
-        current_error = ""
-        raw_response = ""
-        messages = [self.build_message(prompt, page_images)]
+            # Step 2: Try Groq/Gemini LLM for higher quality (2-5s)
+            if llm_service.enabled:
+                try:
+                    # Optionally scrub PII from the text sent to external LLMs
+                    llm_prompt = prompt
+                    if self.settings.scrub_pii_for_llm:
+                        llm_prompt = self.resume_prompt(
+                            scrub_pii(input_text),
+                            has_images=bool(page_images)
+                        ) if schema_cls is ResumeData else self.job_description_prompt(scrub_pii(input_text))
+                        logger.debug("PII scrubbed for external LLM call")
+                    llm_json, provider = llm_service._generate_json(llm_prompt + "\nReturn valid JSON only.", None)
+                    if llm_json:
+                        # Robustness: If LLM returned a list, try to find a dict in it or fail gracefully
+                        if isinstance(llm_json, list):
+                            if len(llm_json) > 0 and isinstance(llm_json[0], dict):
+                                llm_json = llm_json[0]
+                                logger.debug("Extracted first dict from LLM list")
+                            else:
+                                raise ValueError("LLM returned a list instead of a mapping")
 
-        for attempt in range(max_retries + 1):
-            if attempt > 0 and current_error and raw_response.strip():
-                messages.append({"role": "assistant", "content": raw_response})
-                messages.append(
-                    {
+                        validated = schema_cls(**llm_json)
+                        if self.has_meaningful_extraction(validated):
+                            result = self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
+                            elapsed = time.perf_counter() - t0
+                            logger.info("✅ Fast-path extraction (%s) in %.1fs", provider, elapsed)
+                            self._log_extraction_result(result, f"Fast-path:{provider}")
+                            return result
+                except Exception as exc:
+                    logger.warning("Structured AI extraction failed, falling back to heuristic: %s", exc)
+
+            elapsed = time.perf_counter() - t0
+            logger.info("✅ Heuristic-only extraction in %.1fs", elapsed)
+            result = schema_cls(**heuristic_data)
+            self._log_extraction_result(result, "Heuristic")
+            return result
+
+        # ── SLOW PATH: Image-only documents → Ollama VLM ──
+        if has_images and self._ollama_available:
+            messages = [{"role": "user", "content": prompt}]
+            base64_image = self.image_to_base64(self.resize_image(page_images[0]))
+            messages[0]["images"] = [base64_image]
+
+            current_error = ""
+            raw_response = ""
+
+            for attempt in range(max_retries + 1):
+                if attempt > 0 and current_error and raw_response.strip():
+                    messages.append({"role": "assistant", "content": raw_response})
+                    messages.append({
                         "role": "user",
                         "content": f"Your previous output failed validation:\n{current_error}\nReturn corrected JSON only.",
-                    }
-                )
-            elif attempt > 0:
-                logger.warning("Retrying with fresh prompt (attempt %d) after empty response", attempt)
-                messages = [self.build_message(prompt, page_images)]
+                    })
 
-            raw_response = self.generate_response(messages)
+                try:
+                    raw_response = self.generate_ollama_response(messages)
+                except Exception as exc:
+                    logger.error("Ollama VLM request failed: %s", exc)
+                    break
 
-            if not raw_response.strip():
-                current_error = "Model returned an empty response"
-                logger.warning("Model returned empty response on attempt %d", attempt)
-                continue
+                if not raw_response.strip():
+                    current_error = "Model returned an empty response"
+                    continue
 
-            logger.info("Model raw response (attempt %d, %d chars): %.300s", attempt, len(raw_response), raw_response)
+                logger.info("Ollama VLM response (attempt %d): %.300s", attempt, raw_response)
 
+                try:
+                    parsed_json = self.parse_json(raw_response)
+                    validated = schema_cls(**parsed_json)
+                    if self.has_meaningful_extraction(validated):
+                        elapsed = time.perf_counter() - t0
+                        logger.info("✅ VLM extraction in %.1fs", elapsed)
+                        self._log_extraction_result(validated, "VLM:Ollama")
+                        return validated
+                except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                    current_error = str(exc)
+                    logger.warning("VLM extraction attempt %d failed: %s", attempt, exc)
+
+        # ── FINAL FALLBACK ──
+        if not has_text and has_images:
+            raise RuntimeError("Vision-based extraction failed and no OCR text was available.")
+
+        elapsed = time.perf_counter() - t0
+        logger.info("⚠️ Fallback heuristic extraction in %.1fs", elapsed)
+        result = schema_cls(**heuristic(input_text))
+        self._log_extraction_result(result, "Fallback-Heuristic")
+        return result
+
+    def _log_extraction_result(self, result, path: str) -> None:
+        """Log structured summary of extraction results for observability."""
+        is_jd = isinstance(result, JobDescriptionData)
+        skills_count = len(result.must_have_skills) if is_jd else len(getattr(result, 'skills', []))
+        exp_count = len(getattr(result, 'experience_entries', []))
+        
+        logger.info(
+            "Extraction result: path=%s fields_populated=%d skills=%d experience_entries=%d",
+            path,
+            sum(1 for v in result.model_dump().values() if v),
+            skills_count,
+            exp_count,
+        )
+
+    # ─── Ollama Communication ────────────────────────────────────────────
+
+    def generate_ollama_response(self, messages: list[dict[str, Any]]) -> str:
+        payload = {
+            "model": self.settings.model_id,
+            "messages": messages,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0,
+                "num_predict": 1500,
+            },
+        }
+        
+        last_exc = None
+        backoff = 1.0
+        for attempt in range(3):
             try:
-                parsed_json = self.parse_json(raw_response)
-                validated = schema_cls(**parsed_json)
-                if not self.has_meaningful_extraction(validated):
-                    raise ValueError("Extraction produced an empty or low-signal structured result")
-                return self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
-            except (ValidationError, ValueError) as exc:
-                current_error = str(exc)
-                logger.warning(
-                    "Structured extraction attempt %d failed: %s | Raw response preview: %.200s",
-                    attempt, exc, raw_response,
+                response = requests.post(
+                    f"{self.settings.ollama_base_url}/api/chat",
+                    json=payload,
+                    timeout=300,
                 )
-
-        if not input_text.strip() and page_images:
-            raise RuntimeError("Vision-based extraction failed and no OCR text was available for fallback.")
-            
-        logger.warning("VLM Retries exhausted. Attempting Gemini LLM fallback extraction...")
-        fallback_json = llm_service.extract_json_from_text(input_text, schema_cls.model_json_schema())
-        if fallback_json:
-            try:
-                validated = schema_cls(**fallback_json)
-                if self.has_meaningful_extraction(validated):
-                    logger.info("Gemini LLM fallback extraction succeeded.")
-                    return self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
+                response.raise_for_status()
+                return response.json().get("message", {}).get("content", "")
             except Exception as exc:
-                logger.warning("Gemini LLM fallback validation failed: %s", exc)
+                last_exc = exc
+                logger.warning("Ollama attempt %d failed: %s. Retrying in %.1fs...", attempt + 1, exc, backoff)
+                time.sleep(backoff)
+                backoff *= 2
+        
+        raise last_exc or Exception("Ollama extraction failed after 3 attempts")
 
-        logger.warning("Gemini LLM also failed. Falling back to regex heuristic extraction.")
-        return schema_cls(**heuristic(input_text))
+    # ─── Image Utilities ─────────────────────────────────────────────────
+
+    def image_to_base64(self, image: Image.Image) -> str:
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG", quality=80)
+        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+    def resize_image(self, image: Image.Image) -> Image.Image:
+        max_size = 800
+        if image.width <= max_size and image.height <= max_size:
+            return image
+        ratio = min(max_size / image.width, max_size / image.height)
+        return image.resize(
+            (int(image.width * ratio), int(image.height * ratio)),
+            Image.Resampling.LANCZOS,
+        )
+
+    # ─── Validation & Merging ────────────────────────────────────────────
 
     def has_meaningful_extraction(self, extracted) -> bool:
         if isinstance(extracted, ResumeData):
-            return any(
-                [
-                    bool(extracted.name),
-                    bool(extracted.email),
-                    bool(extracted.phone),
-                    bool(extracted.linkedin),
-                    bool(extracted.portfolio),
-                    bool(extracted.summary),
-                    bool(extracted.skills),
-                    bool(extracted.tools),
-                    bool(extracted.experience_entries),
-                    bool(extracted.education_entries),
-                    bool(extracted.certifications),
-                    bool(extracted.projects),
-                    bool(extracted.metadata),
-                ]
-            )
-
+            return any([extracted.name, extracted.email, extracted.skills, extracted.experience_entries])
         if isinstance(extracted, JobDescriptionData):
-            return any(
-                [
-                    bool(extracted.title),
-                    bool(extracted.must_have_skills),
-                    bool(extracted.good_to_have_skills),
-                    bool(extracted.required_education),
-                    bool(extracted.required_certifications),
-                    bool(extracted.domain_keywords),
-                    bool(extracted.responsibilities),
-                    extracted.min_years_experience > 0,
-                ]
-            )
-
+            return any([extracted.title, extracted.must_have_skills])
         return True
 
     def merge_with_heuristic(self, schema_cls, extracted, input_text: str, heuristic):
         if not input_text.strip():
             return extracted
-
         heuristic_model = schema_cls(**heuristic(input_text))
         merged = extracted.model_dump()
-
         for key, value in heuristic_model.model_dump().items():
             if self.is_empty_value(merged.get(key)) and not self.is_empty_value(value):
                 merged[key] = value
-
         return schema_cls(**merged)
 
     def is_empty_value(self, value: Any) -> bool:
         return value in ("", None, 0, 0.0, [], {})
 
-    def build_message(self, prompt: str, page_images: list[Image.Image]) -> dict[str, Any]:
-        content: list[dict[str, Any]] = []
-        if page_images:
-            content.append({"type": "image", "image": self.resize_image(page_images[0])})
-        content.append({"type": "text", "text": prompt})
-        return {"role": "user", "content": content}
-
-    def generate_response(self, messages: list[dict[str, Any]]) -> str:
-        if not self.processor or not self.model:
-            raise RuntimeError("Model is not available")
-
-        rendered_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        has_images = any(
-            isinstance(message.get("content"), list) and any(part.get("type") == "image" for part in message["content"])
-            for message in messages
-        )
-
-        if has_images:
-            if not process_vision_info:
-                raise RuntimeError("qwen-vl-utils is required for image-assisted extraction")
-            image_inputs, video_inputs = process_vision_info(messages)
-            
-            with self._inference_lock:
-                inputs = self.processor(
-                    text=[rendered_prompt],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                ).to(self.device)
-                generated_ids = self.model.generate(**inputs, max_new_tokens=2500, do_sample=False)
-        else:
-            with self._inference_lock:
-                inputs = self.processor(text=[rendered_prompt], padding=True, return_tensors="pt").to(self.device)
-                generated_ids = self.model.generate(**inputs, max_new_tokens=2500, do_sample=False)
-
-        trimmed_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
-        decoded = self.processor.batch_decode(
-            trimmed_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-
-        # Free GPU memory between generations to avoid OOM on multi-resume runs
-        if torch and self.device == "cuda":
-            del inputs, generated_ids, trimmed_ids
-            torch.cuda.empty_cache()
-
-        return decoded
+    # ─── JSON Parsing ────────────────────────────────────────────────────
 
     def parse_json(self, response: str) -> dict[str, Any]:
-        # Step 1: Strip markdown code fences (```json ... ```)
         stripped = re.sub(r"^```(?:json)?\s*\n?", "", response.strip(), count=1)
         stripped = re.sub(r"\n?```\s*$", "", stripped.strip())
 
-        # Step 2: Extract content between first { and last }
         start = stripped.find("{")
         end = stripped.rfind("}")
         if start != -1 and end != -1 and end > start:
-            extracted = stripped[start : end + 1]
-        elif start != -1:
-            # Truncated JSON — no closing brace found, attempt repair
-            extracted = self._repair_truncated_json(stripped[start:])
-            logger.info("Attempting truncated JSON repair (%d chars)", len(extracted))
-        else:
-            extracted = stripped
-
-        # Step 3: Remove trailing commas before } or ]
-        cleaned = re.sub(r",(\s*[\}\]])", r"\1", extracted)
-
-        try:
+            cleaned = stripped[start : end + 1]
+            cleaned = re.sub(r",(\s*[\}\]])", r"\1", cleaned)
             return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"JSON Decode Error: {exc.msg} at line {exc.lineno} col {exc.colno}. "
-                "Ensure trailing commas and unescaped quotes are avoided, and output is complete."
-            )
+        return json.loads(stripped)
 
-    def _repair_truncated_json(self, partial: str) -> str:
-        """Best-effort repair of JSON truncated by token limit.
-
-        Trims any incomplete trailing value, then closes all open brackets
-        and braces so the result is at least structurally valid.
-        """
-        # Strip a trailing incomplete string value (no closing quote)
-        partial = re.sub(r',\s*"[^"]*$', "", partial)          # key missing value
-        partial = re.sub(r':\s*"[^"]*$', ': ""', partial)      # value mid-string
-        partial = re.sub(r',\s*$', "", partial)                 # trailing comma
-        # Remove trailing commas before we close brackets
-        partial = re.sub(r",(\s*)$", r"\1", partial)
-
-        # Count unclosed openers
-        open_braces = partial.count("{") - partial.count("}")
-        open_brackets = partial.count("[") - partial.count("]")
-
-        # Close them in LIFO order (approximate — handles most real cases)
-        closers = "]" * max(open_brackets, 0) + "}" * max(open_braces, 0)
-        return partial + closers
-
-    def resize_image(self, image: Image.Image) -> Image.Image:
-        max_size = 1000
-        if image.width <= max_size and image.height <= max_size:
-            return image
-
-        ratio = min(max_size / image.width, max_size / image.height)
-        return image.resize((int(image.width * ratio), int(image.height * ratio)), Image.Resampling.LANCZOS)
+    # ─── Prompt Templates ────────────────────────────────────────────────
 
     def job_description_prompt(self, text: str) -> str:
         schema_json = JobDescriptionData.model_json_schema()
-        # Hide LLM-only fields so the local VLM doesn't attempt to hallucinate them
         for field in ("implicit_skills", "inferred_seniority", "domain_expectations"):
             schema_json.get("properties", {}).pop(field, None)
 
         return (
-            "You are an HR screening extraction agent. Read the job description and return only valid JSON "
-            f"matching this schema: {json.dumps(schema_json)}. "
-            "Extract: (1) core must-have skills, (2) secondary good-to-have skills, (3) domain-specific capabilities, "
-            "(4) tools and technologies, and (5) behavioral or soft skills. "
-            "Include all skills explicitly mentioned or strongly implied by responsibilities and context. "
-            "Do not restrict extraction to predefined skill lists. "
-            "Map core skills to must_have_skills, secondary/tools/behavioral skills to good_to_have_skills, "
-            "and domain-specific capabilities to domain_keywords. "
-            "Infer minimum experience, education, certifications, and concise responsibilities. "
-            "Return ONLY a strictly valid JSON map matching the specified schema. "
-            "Write EXTREMELY CONCISE summaries for responsibilities. Limit descriptions to a few keywords. "
-            "Never exceed 1000 characters of text.\n\n"
-            f"Job description:\n{text}"
+            "You are an expert technical recruiter. Read the job description and return ONLY valid JSON "
+            f"matching this schema: {json.dumps(schema_json)}.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "1. If the job description is extremely brief (e.g. just a title like 'AI/ML Developer'), you should infer 3-5 "
+            "relevant 'good-to-have' skills or 'domain_keywords' that are standard for this role to provide context. "
+            "Only place skills in 'must_have_skills' if they are explicitly mentioned or are the absolute core of the title.\n"
+            "2. Ensure the extraction is balanced. Do not invent requirements that would unfairly penalize a candidate if missing.\n"
+            "3. Extract all explicit skills, domain keywords, and responsibilities.\n"
+            "4. Categorize the role into one of these 'archetypes': 'management', 'research', 'analyst', 'finance', 'senior', 'data_ml', 'product', or 'standard'.\n\n"
+            f"Job description text:\n{text}"
         )
 
     def resume_prompt(self, text: str, has_images: bool = False) -> str:
         schema_json = ResumeData.model_json_schema()
-        # Hide LLM-only fields so the local VLM doesn't attempt to hallucinate them
-        for field in ("skill_clusters", "enriched_persona"):
-            schema_json.get("properties", {}).pop(field, None)
 
-        source_instruction = (
-            "You are given a resume image and OCR text. OCR may be noisy or incomplete. Use the visible resume image as the primary source and use OCR text as supporting evidence. "
-            if has_images
-            else "You are given resume text extracted from a document. "
-        )
+        source = "resume image" if has_images else "resume text"
         return (
-            "You are an HR resume extraction agent. Read the resume text and return only valid JSON matching "
+            f"You are an HR resume extraction agent. Read the {source} and return only valid JSON matching "
             f"this schema: {json.dumps(schema_json)}. "
-            f"{source_instruction}"
-            "Use section markers like [CONTACT_INFO], [SKILLS], [EXPERIENCE], [EDUCATION], and [PROJECTS] when present. "
-            "STRICT INSTRUCTION: Do NOT extract Education, Coursework, or personal Projects into the Experience section. If the candidate has no dedicated Work Experience section, leave experience_entries empty. "
-            "Extract all relevant skills including technical skills, tools, domain knowledge, soft skills, "
-            "and skills inferred from experience or projects. "
-            "Do not limit extraction to predefined categories or static skill lists. "
-            "Prefer explicit evidence from the resume content. If a detail is clearly visible in the image but imperfect in OCR, still extract it. "
-            "Return ONLY a strictly valid JSON map matching the specified schema. "
-            "Write EXTREMELY CONCISE summaries for job experiences and projects. Do not copy-paste long paragraphs. "
-            "Limit descriptions to 1-2 ultra-short bullet points. Avoid markdown formatting blocks if possible.\n\n"
-            f"Resume text:\n{text}"
+            "\n\nSTRICT INSTRUCTIONS:\n"
+            "1. Use section markers like [CONTACT_INFO], [SKILLS], [EXPERIENCE] etc. as structural hints.\n"
+            "2. Extract ALL relevant skills, tools, and certifications.\n"
+            "3. Extract only the 3 MOST RECENT job experiences and 3 MOST RECENT projects.\n"
+            "4. For experience highlights: PRESERVE quantified impact numbers (%, ms, users, $, scale) "
+            "and ownership verbs (led, designed, built, shipped, owned). These are critical for scoring. "
+            "Truncate generic filler but keep measurable outcomes. Max 120 chars per bullet.\n"
+            "\nReturn ONLY a strictly valid JSON object."
+            f"\n\nResume text:\n{text}"
         )
+
+    # ─── Heuristic Extractors (instant, regex-based) ─────────────────────
 
     def heuristic_job_description(self, text: str) -> dict[str, Any]:
         lines = [normalize_whitespace(line) for line in text.splitlines() if normalize_whitespace(line)]
         lowered_text = text.lower()
-
         title = ""
         title_match = re.search(r"(?im)^(?:job title|role|position)\s*:\s*(.+)$", text)
         if title_match:
@@ -400,138 +358,164 @@ class HRExtractionService:
             years = max(float(match) for match in year_matches)
 
         sections = self.split_named_sections(lines)
-        required_text = "\n".join(sections.get("required", []))
-        preferred_text = "\n".join(sections.get("preferred", []))
-        education_text = "\n".join(sections.get("education", []))
-        certification_text = "\n".join(sections.get("certifications", []))
-        responsibility_lines = sections.get("responsibilities", [])
-        responsibility_text = "\n".join(responsibility_lines)
-
-        must_have = self.extract_skills(required_text or f"{title}\n{responsibility_text}", limit=16)
+        must_have = self.extract_skills("\n".join(sections.get("required", [])), limit=16)
         if not must_have:
-            must_have = self.extract_skills(f"{title}\n{responsibility_text}", limit=12)
-
-        preferred_candidates = self.extract_skills(preferred_text, limit=14)
-        tool_candidates = self.extract_contextual_terms(text, TOOL_CONTEXT_MARKERS, limit=12)
-        soft_skill_candidates = self.extract_contextual_terms(text, SOFT_SKILL_MARKERS, limit=10)
-        good_to_have = self.merge_terms(
-            [preferred_candidates, tool_candidates, soft_skill_candidates],
-            exclude=set(must_have),
-            limit=20,
-        )
-        domain_keywords = self.extract_domain_keywords(title, responsibility_lines, text)
-
-        required_education = [token for token in KNOWN_EDUCATION if token in education_text.lower()]
-        required_certifications = self.extract_phrases(certification_text or "", limit=8, max_tokens=7)
-
-        if not responsibility_lines:
-            responsibility_lines = self.extract_bullets(text, limit=6)
+            must_have = self.extract_skills(text, limit=12)
 
         return {
             "title": title,
             "must_have_skills": must_have,
-            "good_to_have_skills": good_to_have,
+            "good_to_have_skills": self.extract_skills("\n".join(sections.get("preferred", [])), limit=14),
             "min_years_experience": years,
-            "required_education": required_education,
-            "required_certifications": required_certifications,
-            "domain_keywords": domain_keywords,
-            "responsibilities": responsibility_lines,
+            "required_education": [token for token in KNOWN_EDUCATION if token in text.lower()],
+            "required_certifications": [],
+            "domain_keywords": [],
+            "responsibilities": sections.get("responsibilities", [])[:6],
         }
 
     def heuristic_resume(self, text: str) -> dict[str, Any]:
-        annotated_text = annotate_resume_sections(text)
-        sections = self.extract_sections(annotated_text)
-        lines = [line for line in annotated_text.splitlines() if line and not line.startswith("[")]
+        """Robust regex-based resume extraction that searches the FULL text."""
+        sections = self.extract_sections(annotate_resume_sections(text))
+        header_text = "\n".join(sections.get("CONTACT_INFO", [])[:10])
 
-        header_lines = sections.get("CONTACT_INFO", []) or lines[:5]
-        header_text = "\n".join(header_lines)
+        # ── Search FULL TEXT for contact info (not just header section) ──
+        email = re.search(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b", header_text)
+        if not email:
+            email = re.search(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b", text)
 
-        name = ""
-        for line in header_lines:
-            if "@" in line.lower() or "linkedin" in line.lower() or "github" in line.lower():
-                continue
-            if 2 <= len(line.split()) <= 5:
-                name = line
-                break
+        phone = re.search(r"(?:(?:\+\d{1,3}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d[\d\s\-]{7,}\d)", header_text)
+        if not phone:
+            phone = re.search(r"(?:(?:\+\d{1,3}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d[\d\s\-]{7,}\d)", text)
 
-        email_match = re.search(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b", header_text)
-        phone_match = re.search(r"(?:(?:\+\d{1,3}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d[\d\s\-]{7,}\d)", header_text)
-        link_matches = re.findall(r"(?i)\b(?:https?://|www\.)\S+\b", header_text + "\n" + "\n".join(sections.get("LINKS", [])))
-
-        location = ""
-        for line in header_lines:
-            if email_match and email_match.group(0) in line:
-                continue
-            if phone_match and phone_match.group(0) in line:
-                continue
-            if re.search(r"\b(?:india|usa|united states|remote|hybrid)\b", line.lower()) or "," in line:
-                location = line
-                break
-
-        summary = " ".join(sections.get("SUMMARY", [])[:4]).strip()
-        skills_sources = [
-            "\n".join(sections.get("SKILLS", [])),
-            "\n".join(sections.get("EXPERIENCE", [])),
-            "\n".join(sections.get("PROJECTS", [])),
-            summary,
-        ]
-        merged_skill_source = "\n".join(part for part in skills_sources if part)
-        if not merged_skill_source.strip():
-            merged_skill_source = annotated_text
-        skills = self.extract_skills(merged_skill_source, limit=30)
-        if not skills:
-            skills = self.extract_skills(text, limit=20)
-        tools = self.extract_contextual_terms(merged_skill_source, TOOL_CONTEXT_MARKERS, limit=14)
-        if not tools:
-            tools = self.extract_skills("\n".join(sections.get("SKILLS", [])), limit=10)
-        experience_entries = self.parse_experience_entries(sections.get("EXPERIENCE", []))
-        education_entries = self.parse_education_entries(sections.get("EDUCATION", []))
-        certifications = self.extract_phrases("\n".join(sections.get("CERTIFICATIONS", [])), limit=10, max_tokens=7)
-        projects = self.extract_projects(sections.get("PROJECTS", []))
-
-        metadata: dict[str, Any] = {}
-        if link_matches:
-            metadata["links"] = link_matches
-
+        link_matches = re.findall(r"(?i)\b(?:https?://|www\.)\S+\b", text)
         linkedin = next((link for link in link_matches if "linkedin" in link.lower()), "")
-        portfolio = next((link for link in link_matches if "linkedin" not in link.lower()), "")
+        portfolio = next((link for link in link_matches if "github" in link.lower()), "")
+        if not portfolio:
+            portfolio = next((link for link in link_matches if "linkedin" not in link.lower()), "")
+
+        # ── Extract name from first non-link, non-email line ──
+        name = ""
+        all_lines = text.strip().splitlines()
+        candidate_lines = sections.get("CONTACT_INFO", [])[:10] or all_lines[:10]
+        for line in candidate_lines:
+            cleaned = line.strip()
+            if not cleaned or len(cleaned) < 3:
+                continue
+            if "@" in cleaned or "http" in cleaned.lower() or "linkedin" in cleaned.lower():
+                continue
+            if re.match(r"^[\d\+\(\)\-\s]+$", cleaned):  # Skip phone-only lines
+                continue
+            tokens = cleaned.split()
+            if 1 <= len(tokens) <= 5 and all(t[0].isupper() or t[0] == '.' for t in tokens if t):
+                name = cleaned
+                break
+        if not name:
+            for line in all_lines[:5]:
+                cleaned = line.strip()
+                if cleaned and 2 <= len(cleaned.split()) <= 4 and "@" not in cleaned:
+                    name = cleaned
+                    break
+
+        # ── Location extraction ──
+        location = ""
+        loc_match = re.search(
+            r"(?i)(?:location|address|city|based in)[:\s]*(.+)",
+            text[:2000],
+        )
+        if loc_match:
+            location = normalize_whitespace(loc_match.group(1))[:80]
+        else:
+            # Try common patterns like "City, State" or "City, Country"
+            loc_match2 = re.search(r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)?(?:,\s*[A-Z][a-z]+)?)", text[:2000])
+            if loc_match2:
+                location = loc_match2.group(1).strip()
+
+        # ── Skills: search dedicated section first, then full text ──
+        skills_text = "\n".join(sections.get("SKILLS", []))
+        skills = self.extract_skills(skills_text, limit=25) if skills_text.strip() else []
+        if len(skills) < 5:
+            # Broaden: scan the full text for technical terms
+            full_skills = self.extract_skills(text, limit=30)
+            seen = set(s.lower() for s in skills)
+            for s in full_skills:
+                if s.lower() not in seen:
+                    skills.append(s)
+                    seen.add(s.lower())
+                if len(skills) >= 25:
+                    break
+
+        # ── Summary ──
+        summary_lines = sections.get("SUMMARY", []) or sections.get("OBJECTIVE", [])
+        summary = " ".join(summary_lines[:3]).strip()
+        if not summary:
+            # Use first paragraph-like block as summary
+            for line in all_lines[1:10]:
+                cleaned = line.strip()
+                if len(cleaned) > 50 and "@" not in cleaned and "http" not in cleaned:
+                    summary = cleaned[:300]
+                    break
+
+        # ── Experience ──
+        exp_lines = sections.get("EXPERIENCE", []) or sections.get("WORK_EXPERIENCE", [])
+        experience_entries = self.parse_experience_entries(exp_lines) if exp_lines else []
+        if not experience_entries:
+            # Try parsing from full text if sections failed
+            experience_entries = self.parse_experience_entries(all_lines)
+
+        # ── Experience years ──
+        years = 0.0
+        year_matches = re.findall(r"(\d+(?:\.\d+)?)\+?\s*(?:years|yrs)", text.lower())
+        if year_matches:
+            years = max(float(m) for m in year_matches)
+
+        # ── Education ──
+        edu_lines = sections.get("EDUCATION", [])
+        education_entries = self.parse_education_entries(edu_lines) if edu_lines else []
+
+        # ── Projects ──
+        proj_lines = sections.get("PROJECTS", [])
+        projects = [line for line in proj_lines[:5] if line.strip()] if proj_lines else []
+
+        # ── Certifications ──
+        cert_lines = sections.get("CERTIFICATIONS", [])
+        certifications = self.extract_phrases("\n".join(cert_lines), limit=10) if cert_lines else []
 
         return {
             "name": name,
-            "email": email_match.group(0) if email_match else "",
-            "phone": phone_match.group(0) if phone_match else "",
+            "email": email.group(0) if email else "",
+            "phone": phone.group(0) if phone else "",
             "location": location,
             "linkedin": linkedin,
             "portfolio": portfolio,
             "summary": summary,
             "skills": skills,
-            "tools": tools,
+            "tools": [],
+            "total_years_experience": years,
             "experience_entries": experience_entries,
             "education_entries": education_entries,
             "certifications": certifications,
             "projects": projects,
-            "metadata": metadata,
+            "metadata": {},
         }
 
+    # ─── Section & Skill Parsing Utilities ───────────────────────────────
+
     def split_named_sections(self, lines: list[str]) -> dict[str, list[str]]:
-        sections = {"required": [], "preferred": [], "responsibilities": [], "education": [], "certifications": []}
+        sections: dict[str, list[str]] = {"required": [], "preferred": [], "responsibilities": [], "education": []}
         current = ""
         for line in lines:
-            lowered = line.lower().rstrip(":")
-            if "required" in lowered and "skill" in lowered:
+            low = line.lower()
+            if "required" in low and "skill" in low:
                 current = "required"
                 continue
-            if any(token in lowered for token in ("preferred", "nice to have", "good to have", "bonus")):
+            if any(t in low for t in ("preferred", "nice to have", "good to have", "bonus")):
                 current = "preferred"
                 continue
-            if "responsibilit" in lowered:
+            if "responsibil" in low:
                 current = "responsibilities"
                 continue
-            if "education" in lowered or "qualification" in lowered:
+            if "education" in low or "qualification" in low:
                 current = "education"
-                continue
-            if "certification" in lowered or "license" in lowered:
-                current = "certifications"
                 continue
             if current:
                 sections[current].append(line)
@@ -540,7 +524,6 @@ class HRExtractionService:
     def extract_sections(self, text: str) -> dict[str, list[str]]:
         sections: dict[str, list[str]] = {}
         current = "CONTACT_INFO"
-        sections[current] = []
         for line in text.splitlines():
             if not line.strip():
                 continue
@@ -554,48 +537,15 @@ class HRExtractionService:
     def extract_skills(self, text: str, limit: int = 16) -> list[str]:
         return self.extract_phrases(text, limit=limit, max_tokens=5)
 
-    def extract_domain_keywords(self, title: str, responsibilities: list[str], text: str) -> list[str]:
-        combined = f"{title}\n" + "\n".join(responsibilities) + "\n" + text
-        candidates = re.findall(r"[a-z][a-z0-9\+\#]{3,}", combined.lower())
-        result: list[str] = []
-        seen: set[str] = set()
-        for token in candidates:
-            normalized = normalize_skill(token)
-            if (
-                not normalized
-                or normalized in seen
-                or normalized in DOMAIN_NOISE
-                or normalized in KNOWN_EDUCATION
-            ):
-                continue
-            seen.add(normalized)
-            result.append(normalized)
-            if len(result) >= 10:
-                break
-        return result
-
-    def extract_bullets(self, text: str, limit: int) -> list[str]:
-        lines = [normalize_whitespace(self.strip_bullet_prefix(line)) for line in text.splitlines()]
-        bullets = [line for line in lines if line and len(line.split()) > 4]
-        return bullets[:limit]
-
-    def extract_phrases(
-        self,
-        text: str,
-        limit: int,
-        max_tokens: int = 6,
-        min_tokens: int = 1,
-    ) -> list[str]:
+    def extract_phrases(self, text: str, limit: int = 16, max_tokens: int = 6) -> list[str]:
         items: list[str] = []
         seen: set[str] = set()
         for chunk in re.split(r"[\n,;/|]+", text):
             cleaned = normalize_skill(chunk)
-            if not cleaned or cleaned in seen:
+            if not cleaned or cleaned in seen or cleaned in SKILL_NOISE:
                 continue
             tokens = cleaned.split()
-            if len(tokens) < min_tokens or len(tokens) > max_tokens:
-                continue
-            if cleaned in SKILL_NOISE or all(token in SKILL_NOISE for token in tokens):
+            if len(tokens) > max_tokens:
                 continue
             seen.add(cleaned)
             items.append(cleaned)
@@ -603,56 +553,53 @@ class HRExtractionService:
                 break
         return items
 
-    def extract_contextual_terms(self, text: str, markers: tuple[str, ...], limit: int = 10) -> list[str]:
-        contextual_lines = [
-            normalize_whitespace(self.strip_bullet_prefix(line))
-            for line in text.splitlines()
-            if any(marker in line.lower() for marker in markers)
-        ]
-        if not contextual_lines:
-            return []
-        return self.extract_phrases("\n".join(contextual_lines), limit=limit, max_tokens=5)
-
-    def merge_terms(self, groups: list[list[str]], exclude: set[str] | None = None, limit: int = 20) -> list[str]:
-        excluded = {normalize_skill(item) for item in (exclude or set()) if normalize_skill(item)}
-        result: list[str] = []
-        seen: set[str] = set()
-        for group in groups:
-            for term in group:
-                normalized = normalize_skill(term)
-                if not normalized or normalized in excluded or normalized in seen:
-                    continue
-                seen.add(normalized)
-                result.append(normalized)
-                if len(result) >= limit:
-                    return result
-        return result
-
-    def strip_bullet_prefix(self, value: str) -> str:
-        return re.sub(r"^[\-\*\u2022\s]+", "", value)
-
     def parse_experience_entries(self, lines: list[str]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
 
         for line in lines:
-            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
+            cleaned = normalize_whitespace(line).strip()
             if not cleaned:
                 continue
 
             date_match = re.search(
-                r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4}\s*(?:-|to|\u2013)\s*(?:present|current|now|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4})",
+                r"(?i)\b(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4}|\d{4})\s*(?:-|to|\u2013)\s*(?:present|current|now|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)?\.?\s*\d{4}|\d{4})",
                 cleaned,
             )
-            delimiter_entry = "|" in cleaned or " at " in cleaned.lower()
-            if date_match or delimiter_entry:
+            has_delimiter = "|" in cleaned or " at " in cleaned.lower()
+
+            if date_match or has_delimiter:
                 if current:
                     entries.append(current)
-                current = self.build_experience_entry(cleaned, date_match.group(0) if date_match else "")
+                remaining = cleaned.replace(date_match.group(0) if date_match else "", "").strip(" -|,")
+                title, company = remaining, ""
+                if "|" in remaining:
+                    parts = [p.strip() for p in remaining.split("|") if p.strip()]
+                    title = parts[0] if parts else remaining
+                    company = parts[1] if len(parts) > 1 else ""
+                elif " at " in remaining.lower():
+                    parts = re.split(r"(?i)\bat\b", remaining, maxsplit=1)
+                    title = parts[0].strip()
+                    company = parts[1].strip() if len(parts) > 1 else ""
+
+                start_date, end_date = "", ""
+                if date_match:
+                    dp = re.split(r"(?i)\s*(?:-|to|\u2013)\s*", date_match.group(0), maxsplit=1)
+                    if len(dp) == 2:
+                        start_date, end_date = dp
+
+                current = {
+                    "company": company,
+                    "title": title,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "highlights": [],
+                    "skills_used": self.extract_skills(remaining),
+                }
                 continue
 
             if current is None:
-                current = self.build_experience_entry(cleaned, "")
+                current = {"company": "", "title": cleaned, "start_date": "", "end_date": "", "highlights": [], "skills_used": []}
                 continue
 
             current.setdefault("highlights", []).append(cleaned)
@@ -660,73 +607,24 @@ class HRExtractionService:
 
         if current:
             entries.append(current)
-
         return entries[:10]
-
-    def build_experience_entry(self, line: str, date_range: str) -> dict[str, Any]:
-        remaining = line.replace(date_range, "").strip(" -|,")
-        title = ""
-        company = ""
-
-        if "|" in remaining:
-            parts = [part.strip() for part in remaining.split("|") if part.strip()]
-            if len(parts) >= 2:
-                title, company = parts[0], parts[1]
-            elif parts:
-                title = parts[0]
-        elif " at " in remaining.lower():
-            parts = re.split(r"(?i)\bat\b", remaining, maxsplit=1)
-            title = parts[0].strip(" ,-")
-            company = parts[1].strip(" ,-") if len(parts) > 1 else ""
-        elif "," in remaining:
-            parts = [part.strip() for part in remaining.split(",", 1)]
-            title = parts[0]
-            company = parts[1] if len(parts) > 1 else ""
-        else:
-            title = remaining
-
-        start_date = ""
-        end_date = ""
-        if date_range:
-            date_parts = re.split(r"(?i)\s*(?:-|to|\u2013)\s*", date_range, maxsplit=1)
-            if len(date_parts) == 2:
-                start_date, end_date = date_parts
-
-        return {
-            "company": company,
-            "title": title,
-            "start_date": start_date,
-            "end_date": end_date,
-            "highlights": [],
-            "skills_used": self.extract_skills(remaining),
-        }
 
     def parse_education_entries(self, lines: list[str]) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for line in lines:
-            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
+            cleaned = normalize_whitespace(line).strip()
             if not cleaned:
                 continue
-            graduation_match = re.search(r"\b(?:19|20)\d{2}\b", cleaned)
-            parts = [part.strip() for part in re.split(r"[|,]", cleaned) if part.strip()]
-            degree = parts[0] if parts else cleaned
-            institution = parts[1] if len(parts) > 1 else ""
-            entries.append(
-                {
-                    "degree": degree,
-                    "institution": institution,
-                    "field_of_study": "",
-                    "graduation_date": graduation_match.group(0) if graduation_match else "",
-                    "score": "",
-                }
-            )
+            grad_match = re.search(r"\b(?:19|20)\d{2}\b", cleaned)
+            parts = [p.strip() for p in re.split(r"[|,]", cleaned) if p.strip()]
+            entries.append({
+                "degree": parts[0] if parts else cleaned,
+                "institution": parts[1] if len(parts) > 1 else "",
+                "field_of_study": "",
+                "graduation_date": grad_match.group(0) if grad_match else "",
+                "score": "",
+            })
         return entries[:5]
 
-    def extract_projects(self, lines: list[str]) -> list[str]:
-        projects: list[str] = []
-        for line in lines:
-            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
-            if cleaned:
-                projects.append(cleaned)
-        return projects[:10]
-
+    def strip_bullet_prefix(self, value: str) -> str:
+        return re.sub(r"^[\-\*\u2022\s]+", "", value)

@@ -58,7 +58,7 @@ class DocumentParser:
             return self._parse_docx(content)
         return self._parse_image(content)
 
-    def _parse_pdf(self, content: bytes) -> ParsedDocument:
+    def _parse_pdf(self, content: bytes, force_vision: bool = True) -> ParsedDocument:
         warnings: list[str] = []
         page_count = 0
 
@@ -71,6 +71,7 @@ class DocumentParser:
                     f"Processed only the first {self.settings.max_pages_per_resume} pages out of {page_count}"
                 )
             direct_text = "\n".join((page.extract_text() or "") for page in selected_pages).strip()
+            # If text is good enough, return immediately
             if len(re.sub(r"\s+", "", direct_text)) >= self.settings.min_pdf_text_chars:
                 return ParsedDocument(
                     text=annotate_resume_sections(direct_text),
@@ -79,12 +80,13 @@ class DocumentParser:
                 )
 
         if not convert_from_bytes:
-            raise RuntimeError("PDF OCR fallback is unavailable because pdf2image is not installed")
+            raise RuntimeError("PDF image conversion is unavailable because pdf2image is not installed")
 
         convert_kwargs = {"first_page": 1, "last_page": self.settings.max_pages_per_resume}
         if self.settings.poppler_path:
             convert_kwargs["poppler_path"] = self.settings.poppler_path
 
+        # Convert PDF to images for VLM/OCR
         images = convert_from_bytes(content, **convert_kwargs)
         if not images:
             raise ValueError("Unable to read PDF pages")
@@ -92,23 +94,26 @@ class DocumentParser:
         if not page_count:
             page_count = len(images)
 
+        page_images: list[Image.Image] = [img.convert("RGB") for img in images]
+
+        # SPEED OPTIMIZATION: If force_vision is True, we skip Tesseract OCR entirely.
+        # This saves 5-10 seconds per page and lets the VLM handle extraction from the images.
+        if force_vision:
+            return ParsedDocument(
+                text="", # VLM will use images as primary source
+                page_images=page_images,
+                warnings=warnings,
+                page_count=page_count,
+            )
+
+        # Legacy OCR Fallback (only if force_vision=False)
         page_texts: list[str] = []
-        page_images: list[Image.Image] = []
-        for image in images[: self.settings.max_pages_per_resume]:
-            rgb_image = image.convert("RGB")
-            page_images.append(rgb_image)
+        for rgb_image in page_images:
             try:
                 page_texts.append(get_structured_ocr(preprocess(rgb_image)))
             except OCRUnavailableError as exc:
-                warnings.append(
-                    f"OCR unavailable for this machine: {exc}. Falling back to vision-only extraction if the model is available."
-                )
-                return ParsedDocument(
-                    text="",
-                    page_images=page_images,
-                    warnings=warnings,
-                    page_count=page_count,
-                )
+                warnings.append(f"OCR failed: {exc}. Using vision fallback.")
+                break
 
         return ParsedDocument(
             text="\n\n".join(page_texts).strip(),
@@ -116,6 +121,7 @@ class DocumentParser:
             warnings=warnings,
             page_count=page_count,
         )
+
 
     def _parse_docx(self, content: bytes) -> ParsedDocument:
         if not Document:
@@ -126,7 +132,7 @@ class DocumentParser:
 
         for table in document.tables:
             for row in table.rows:
-                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                row_text = "\n".join(cell.text.strip() for cell in row.cells if cell.text.strip())
                 if row_text:
                     chunks.append(row_text)
 

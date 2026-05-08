@@ -86,22 +86,37 @@ SENIORITY_MAP: dict[str, int] = {
     "trainee": 1,
     "junior": 2,
     "associate": 2,
+    # Indian tech / FAANG leveling
+    "sde-1": 2, "sde 1": 2, "sde1": 2,
+    "l3": 2,
+    "ic3": 3,
     "engineer": 3,
     "developer": 3,
     "analyst": 3,
+    "mts": 3,
+    "sde-2": 3, "sde 2": 3, "sde2": 3,
+    "l4": 3,
     "senior": 4,
+    "sse": 4,
+    "sde-3": 4, "sde 3": 4, "sde3": 4,
+    "mts-2": 4,
+    "l5": 4,
+    "ic4": 4,
     "staff": 5,
     "lead": 5,
     "principal": 5,
     "architect": 5,
+    "tl": 5,
+    "mts-3": 5,
+    "l6": 5,
+    "ic5": 5,
     "manager": 6,
     "head": 6,
     "director": 6,
+    "em": 6,
+    "l7": 6,
+    "ic6": 6,
 }
-
-SENIOR_ROLE_TOKENS: set[str] = {"senior", "lead", "principal", "manager", "architect", "staff"}
-RESEARCH_ROLE_TOKENS: set[str] = {"research", "scientist", "phd"}
-
 # ---------------------------------------------------------------------------
 # Known education tokens — matched during heuristic JD education extraction
 # ---------------------------------------------------------------------------
@@ -181,3 +196,18 @@ CONTACT_HINTS: tuple[str, ...] = ("@", "linkedin", "github", "portfolio", "phone
 # Supported file extensions for resume uploads
 # ---------------------------------------------------------------------------
 SUPPORTED_EXTENSIONS: set[str] = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
+
+# ---------------------------------------------------------------------------
+# Scoring configuration — tunable parameters for the scoring engine
+# ---------------------------------------------------------------------------
+SCORING_CONFIG: dict[str, float] = {
+    "skill_evidence_decay": 0.85,
+    "skill_base_weight": 0.60,
+    "skill_highlight_weight": 0.60,
+    "skill_project_weight": 0.50,
+    "skill_listed_weight": 0.75,
+    "progression_non_decreasing_weight": 0.65,
+    "progression_upward_gain_weight": 0.35,
+    "breadth_min_skills": 4,
+    "breadth_floor": 0.7,
+}
