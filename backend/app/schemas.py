@@ -165,6 +165,7 @@ class JobDescriptionData(BaseModel):
     required_certifications: list[str] = Field(default_factory=list, description="Required or preferred certifications")
     domain_keywords: list[str] = Field(default_factory=list, description="Domain or business context keywords")
     responsibilities: list[str] = Field(default_factory=list, description="Key responsibilities from the JD")
+    archetype: str = Field(default="standard", description="Role archetype (e.g. management, research, analyst, finance, senior, data_ml, product, standard)")
 
     @field_validator("title", mode="before")
     @classmethod
@@ -284,13 +285,13 @@ class ResumeData(BaseModel):
         edu_inst_kw = {"institute", "university", "college", "school", "academy"}
         work_kw = {
             "assistant", "researcher", "professor", "lecturer", "intern", 
-            "developer", "engineer", "manager", "lead", "coordinator", 
-            "tutor", "instructor", "faculty", "staff", "postdoc", "fellow", 
-            "consultant", "freelance", "freelancer", "founder", "mentor",
-            "creator", "writer", "designer", "editor", "analyst",
-            "specialist", "executive", "administrator", "scientist", 
-            "architect", "technician", "associate", "expert", "officer",
-            "director", "head", "principal", "president", "vp"
+            "developer", "dev", "engineer", "software", "fullstack", "frontend", "backend",
+            "manager", "lead", "coordinator", "tutor", "instructor", "faculty", 
+            "staff", "postdoc", "fellow", "consultant", "freelance", "freelancer", 
+            "founder", "mentor", "creator", "writer", "designer", "editor", "analyst",
+            "specialist", "executive", "administrator", "scientist", "architect", 
+            "technician", "associate", "expert", "officer", "director", "head", 
+            "principal", "president", "vp", "ui", "ux"
         }
 
         for entry in value:
@@ -380,11 +381,12 @@ class ResumeData(BaseModel):
 
 class CandidateScore(BaseModel):
     total_score: int = Field(default=0, ge=0, le=100)
-    skills_score: int = Field(default=0, ge=0, le=40)
-    experience_score: int = Field(default=0, ge=0, le=35)
-    education_score: int = Field(default=0, ge=0, le=25)
-    keyword_score: int = Field(default=0, ge=0, le=10)
-    completeness_score: int = Field(default=0, ge=0, le=5)
+    skills_score: int = Field(default=0, ge=0)
+    experience_score: int = Field(default=0, ge=0)
+    education_score: int = Field(default=0, ge=0)
+    keyword_score: int = Field(default=0, ge=0)
+    completeness_score: int = Field(default=0, ge=0)
+    budgets: dict[str, int] = Field(default_factory=dict)
     confidence_score: int = Field(default=0, ge=0, le=100)
     risk_score: int = Field(default=0, ge=0, le=100)
     matched_skills: list[str] = Field(default_factory=list)

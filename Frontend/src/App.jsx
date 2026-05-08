@@ -1,4 +1,6 @@
-import { useRef, useMemo, useState } from "react";
+import { useRef, useMemo, useState, useCallback, useEffect } from "react";
+
+const ACCEPTED_EXTENSIONS = new Set([".pdf", ".docx", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"]);
 import { getApiBaseUrl, getErrorMessage } from "./api";
 
 const SCORE_WEIGHTS = [
@@ -39,19 +41,47 @@ export default function App() {
   const [jobDescription, setJobDescription] = useState("");
   const [topK, setTopK] = useState(5);
   const [resumeFiles, setResumeFiles] = useState([]);
+  const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef(null);
 
-  function handleFilesAdded(event) {
-    const incoming = Array.from(event.target.files || []);
+  function addValidatedFiles(incoming) {
     if (!incoming.length) return;
+    const rejected = incoming.filter((f) => {
+      const ext = f.name.slice(f.name.lastIndexOf(".")).toLowerCase();
+      return !ACCEPTED_EXTENSIONS.has(ext);
+    });
+    const valid = incoming.filter((f) => {
+      const ext = f.name.slice(f.name.lastIndexOf(".")).toLowerCase();
+      return ACCEPTED_EXTENSIONS.has(ext);
+    });
+    if (rejected.length) {
+      setErrorText(`Unsupported file(s): ${rejected.map((f) => f.name).join(", ")}`);
+    }
+    if (!valid.length) return;
     setResumeFiles((prev) => {
       const existingKeys = new Set(prev.map((f) => `${f.name}__${f.size}`));
-      const unique = incoming.filter((f) => !existingKeys.has(`${f.name}__${f.size}`));
+      const unique = valid.filter((f) => !existingKeys.has(`${f.name}__${f.size}`));
       return [...prev, ...unique];
     });
-    // reset so the same folder can be re-selected if needed
+  }
+
+  function handleFilesAdded(event) {
+    addValidatedFiles(Array.from(event.target.files || []));
     event.target.value = "";
   }
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    addValidatedFiles(Array.from(e.dataTransfer.files));
+  }, []);
+
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback(() => setIsDragging(false), []);
 
   function removeFile(index) {
     setResumeFiles((prev) => prev.filter((_, i) => i !== index));
@@ -60,6 +90,17 @@ export default function App() {
   function clearAllFiles() {
     setResumeFiles([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  function exportResults() {
+    if (!responseData) return;
+    const blob = new Blob([JSON.stringify(responseData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "screening-results.json";
+    a.click();
+    URL.revokeObjectURL(url);
   }
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState("");
@@ -78,6 +119,20 @@ export default function App() {
       Math.min(selectedIndex, responseData.results.length - 1)
     ];
   }, [responseData, selectedIndex]);
+
+  // Keyboard Navigation (6.5)
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (!responseData?.results?.length) return;
+      if (e.key === "ArrowDown") {
+        setSelectedIndex((prev) => Math.min(prev + 1, responseData.results.length - 1));
+      } else if (e.key === "ArrowUp") {
+        setSelectedIndex((prev) => Math.max(prev - 1, 0));
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [responseData]);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -155,7 +210,12 @@ export default function App() {
               />
             </label>
 
-            <div className="resume-upload-section">
+            <div
+              className={`resume-upload-section${isDragging ? " drag-active" : ""}`}
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+            >
               <span className="field-label">Resumes</span>
               <input
                 ref={fileInputRef}
@@ -210,6 +270,7 @@ export default function App() {
               <input
                 type="number"
                 min="1"
+                max={resumeFiles.length || 100}
                 value={topK}
                 onChange={(event) => setTopK(event.target.value)}
               />
@@ -227,10 +288,15 @@ export default function App() {
           <div className="results-panel-head">
             <h2>Ranked Results</h2>
             {responseData ? (
-              <p>
-                Processed {responseData.processed_count} | Failed{" "}
-                {responseData.failed_count}
-              </p>
+              <div className="results-meta">
+                <p>
+                  Processed {responseData.processed_count} | Failed{" "}
+                  {responseData.failed_count}
+                </p>
+                <button type="button" className="btn-secondary btn-sm" onClick={exportResults}>
+                  ⬇ Export JSON
+                </button>
+              </div>
             ) : (
               <p></p>
             )}
@@ -283,23 +349,44 @@ export default function App() {
                     <div className="score-total">
                       <span>Total Score</span>
                       <strong>{selectedResult.score.total_score}</strong>
+                      <span className="confidence-tag">
+                        Confidence: {selectedResult.score.confidence_score}%
+                      </span>
                     </div>
                   </header>
 
                   <section className="score-breakdown">
-                    {SCORE_WEIGHTS.map((scoreItem) => (
-                      <ScoreRow
-                        key={scoreItem.key}
-                        label={scoreItem.label}
-                        value={selectedResult.score[scoreItem.key]}
-                        max={scoreItem.max}
-                      />
-                    ))}
+                    {SCORE_WEIGHTS.map((scoreItem) => {
+                      const budgetMax = selectedResult.score.budgets?.[scoreItem.key.replace("_score", "")] || scoreItem.max;
+                      return (
+                        <ScoreRow
+                          key={scoreItem.key}
+                          label={scoreItem.label}
+                          value={selectedResult.score[scoreItem.key]}
+                          max={budgetMax}
+                        />
+                      );
+                    })}
                   </section>
+
+                  {(selectedResult.score.additional_skills_bonus_score > 0 ||
+                    selectedResult.score.detected_domain_tags?.length > 0) && (
+                    <p className="score-note">
+                      +{selectedResult.score.additional_skills_bonus_score || 0} bonus (additional skills)
+                      {selectedResult.score.detected_domain_tags?.length > 0 &&
+                        ` · +${selectedResult.score.detected_domain_tags.length} domain`}
+                      {" "}· Total: {selectedResult.score.total_score}/100
+                    </p>
+                  )}
 
                   <section className="detail-row">
                     <h4>Recommendation</h4>
                     <ResultPill text={selectedResult.score.recommendation} />
+                    {selectedResult.hiring_decision && (
+                      <p className="hiring-decision">
+                        Decision: {selectedResult.hiring_decision}
+                      </p>
+                    )}
                   </section>
 
                   <section className="detail-row">
@@ -373,6 +460,39 @@ export default function App() {
                       </ul>
                     </section>
                   ) : null}
+
+                  {selectedResult.score.additional_relevant_skills?.length > 0 && (
+                    <section className="detail-row">
+                      <h4>Additional Relevant Skills</h4>
+                      <div className="pill-wrap">
+                        {selectedResult.score.additional_relevant_skills.map((s) => (
+                          <ResultPill key={s} text={s} />
+                        ))}
+                      </div>
+                    </section>
+                  )}
+
+                  {selectedResult.interview_focus_areas?.length > 0 && (
+                    <section className="detail-row">
+                      <h4>Interview Focus Areas</h4>
+                      <ul>
+                        {selectedResult.interview_focus_areas.map((area, i) => (
+                          <li key={i}>{area}</li>
+                        ))}
+                      </ul>
+                    </section>
+                  )}
+
+                  {selectedResult.hidden_strengths?.length > 0 && (
+                    <section className="detail-row">
+                      <h4>Hidden Strengths</h4>
+                      <div className="pill-wrap">
+                        {selectedResult.hidden_strengths.map((s, i) => (
+                          <ResultPill key={i} text={s} />
+                        ))}
+                      </div>
+                    </section>
+                  )}
                 </article>
               ) : null}
             </div>

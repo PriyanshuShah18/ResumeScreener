@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from dotenv import load_dotenv
 
@@ -36,6 +36,8 @@ class Settings:
     gemini_api_key: str | None
     groq_api_key: str | None
     openrouter_api_key: str | None
+    scrub_pii_for_llm: bool
+    allowed_origins: tuple[str, ...] = ("http://localhost:5173",)
 
 
 @lru_cache(maxsize=1)
@@ -53,6 +55,12 @@ def get_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
         groq_api_key=os.getenv("GROQ_API_KEY"),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+        scrub_pii_for_llm=_get_bool("SCRUB_PII_FOR_LLM", False),
+        allowed_origins=tuple(
+            o.strip()
+            for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+            if o.strip()
+        ),
     )
 
     if not settings.groq_api_key and not settings.gemini_api_key and not settings.openrouter_api_key:

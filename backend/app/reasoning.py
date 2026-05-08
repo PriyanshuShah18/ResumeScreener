@@ -66,7 +66,12 @@ def build_reasoning_prompt(job: JobDescriptionData, resume: ResumeData, score: C
         "2. **Strict Anti-Hallucination:** DO NOT invent skills. DO NOT claim unrelated skills are 'essential'. "
         "For example, if testing a React Native role, possessing Python/Java is NOT relevant frontend experience. "
         "Do not falsely compensate with functionally unrelated tech.\n"
-        "3. **Objective Reality:** Only base your explanation on the EXACT data provided in CandidateScore and ResumeData.\n\n"
+        "3. **Objective Reality:** Only base your explanation on the EXACT data provided in CandidateScore and ResumeData.\n"
+        "4. **Evaluate Impact Evidence vs. Skill Claims:** A candidate listing 'Python' as a skill "
+        "is worth less than a candidate whose highlights show them using Python at scale with measurable outcomes. "
+        "When populating strengths and hidden_strengths, prioritize evidence-based strengths (demonstrated at scale) "
+        "over skill-based strengths (mentioned in skills list). When populating interview_focus_areas, include at "
+        "least one probe for the *scale* of claimed experience.\n\n"
         f"JobDescriptionData:\n{json.dumps(job.model_dump(), ensure_ascii=True)}\n\n"
         f"ResumeData:\n{json.dumps(resume.model_dump(), ensure_ascii=True)}\n\n"
         f"CandidateScore:\n{json.dumps(score.model_dump(), ensure_ascii=True)}"
@@ -91,10 +96,15 @@ def generate_reasoning(
     
     if not result:
         return fallback_reasoning(job, resume, score)
-        
-    return ReasoningOutput(
-        hiring_decision=result.get("hiring_decision", "manual recruiter review"),
-        fit_rationale=result.get("fit_rationale", fallback_reasoning(job, resume, score).fit_rationale),
-        interview_focus_areas=result.get("interview_focus_areas", []),
-        hidden_strengths=result.get("hidden_strengths", [])
-    )
+
+    try:
+        return ReasoningOutput.model_validate(result)
+    except Exception:
+        # LLM returned malformed data — use what we can, fall back for the rest
+        fb = fallback_reasoning(job, resume, score)
+        return ReasoningOutput(
+            hiring_decision=result.get("hiring_decision", fb.hiring_decision),
+            fit_rationale=result.get("fit_rationale", fb.fit_rationale),
+            interview_focus_areas=result.get("interview_focus_areas", fb.interview_focus_areas) if isinstance(result.get("interview_focus_areas"), list) else fb.interview_focus_areas,
+            hidden_strengths=result.get("hidden_strengths", fb.hidden_strengths) if isinstance(result.get("hidden_strengths"), list) else fb.hidden_strengths,
+        )

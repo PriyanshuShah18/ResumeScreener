@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+bin/
+lib/
+include/
+.env
+.git/
+.vscode/
+tests/
+skill_graph_cache.json
+*.tmp

@@ -171,6 +171,27 @@ button:disabled {
 .resume-upload-section {
   display: grid;
   gap: 0.5rem;
+  border: 2px dashed transparent;
+  border-radius: 8px;
+  padding: 0.5rem;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.resume-upload-section.drag-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.results-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.btn-sm {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.78rem;
 }
 
 .field-label {
@@ -403,6 +424,29 @@ button:disabled {
   height: 100%;
   background: linear-gradient(90deg, #0f5b54, #2a8f84);
   transition: width 0.45s ease;
+}
+
+.confidence-tag {
+  font-size: 0.7rem !important;
+  color: var(--accent) !important;
+  text-transform: none !important;
+  letter-spacing: 0.02em !important;
+  opacity: 0.85;
+  margin-top: 0.15rem;
+}
+
+.score-note {
+  margin-top: 0.55rem;
+  font-size: 0.78rem;
+  color: var(--ink-muted);
+  font-style: italic;
+}
+
+.hiring-decision {
+  margin-top: 0.4rem;
+  font-weight: 500;
+  color: var(--accent);
+  font-size: 0.88rem;
 }
 
 .detail-row {

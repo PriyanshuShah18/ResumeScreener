@@ -132,7 +132,7 @@ class DocumentParser:
 
         for table in document.tables:
             for row in table.rows:
-                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                row_text = "\n".join(cell.text.strip() for cell in row.cells if cell.text.strip())
                 if row_text:
                     chunks.append(row_text)
 

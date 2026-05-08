@@ -1,4 +1,5 @@
 import json
+import os
 import logging
 import threading
 import time
@@ -22,7 +23,7 @@ try:
 except ImportError:
     genai = None
 
-SKILL_GRAPH_CACHE_FILE = Path("skill_graph_cache.json")
+SKILL_GRAPH_CACHE_FILE = Path(__file__).resolve().parent.parent / "skill_graph_cache.json"
 
 
 class _RateLimiter:
@@ -50,6 +51,7 @@ class LLMUnderstandingService:
     def __init__(self):
         self.settings = get_settings()
         self.enabled = False
+        self._cache_lock = threading.Lock()
 
         # ── 1. Groq (Fastest) ──
         self.groq_client = None
@@ -62,6 +64,8 @@ class LLMUnderstandingService:
                 self.enabled = True
                 logger.info("✅ Groq initialized")
             except Exception: pass
+
+        self._groq_limiter = _RateLimiter(max_calls=25, window_seconds=60.0)
 
         # ── 2. Gemini Direct ──
         self.gemini_model = None
@@ -82,7 +86,9 @@ class LLMUnderstandingService:
 
         # ── 4. Local Ollama ──
         self.ollama_base = str(self.settings.ollama_base_url).rstrip("/")
-        logger.info("✅ Local Ollama Fallback active")
+        if self.ollama_base:
+            self.enabled = True
+            logger.info("✅ Local Ollama Fallback active at %s", self.ollama_base)
 
     def _generate_json_with_retry(self, provider_func, provider_name: str, retries: int = 2) -> Any:
         """Helper to retry a provider if it hits a rate limit."""
@@ -110,25 +116,31 @@ class LLMUnderstandingService:
         return res
 
     def _generate_json(self, prompt: str, default: Any) -> tuple[Any, str]:
-        # ── Layer 1: Groq (Tiered: 70B then 8B) ──
-        if self.groq_client:
-            for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+        # ── Layer 1: Groq (Tiered: 70B then Qwen then 8B) ──
+        if self.groq_client and self._groq_limiter.acquire():
+            for model in ["llama-3.3-70b-versatile", "qwen-2.5-32b", "llama-3.1-8b-instant"]:
                 try:
-                    resp = self.groq_client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                        response_format={"type": "json_object"},
-                        timeout=25.0
-                    )
-                    return json.loads(resp.choices[0].message.content), f"Groq:{model}"
+                    def _groq_call(m=model, p=prompt):
+                        return self.groq_client.chat.completions.create(
+                            model=m,
+                            messages=[{"role": "user", "content": p}],
+                            response_format={"type": "json_object"},
+                            timeout=25.0
+                        )
+                    resp = self._generate_json_with_retry(_groq_call, f"Groq:{model}")
+                    if resp:
+                        return json.loads(resp.choices[0].message.content), f"Groq:{model}"
                 except Exception:
                     continue
 
         # ── Layer 2: Gemini Direct ──
         if self.gemini_model and self._gemini_limiter.acquire():
+            logger.info("🔄 Falling back to Layer 2: Gemini Direct")
             try:
+                # Add a 'High Context' hint for fallback models
+                fallback_prompt = prompt + "\n\nCRITICAL: You are providing a high-precision extraction. Ensure all entities are captured accurately."
                 resp = self.gemini_model.generate_content(
-                    prompt,
+                    fallback_prompt,
                     generation_config=genai.GenerationConfig(response_mime_type="application/json"),
                 )
                 return json.loads(resp.text), "Gemini:2.5-flash"
@@ -136,7 +148,16 @@ class LLMUnderstandingService:
 
         # ── Layer 3: OpenRouter (Multi-model) ──
         if self.openrouter_key and len(str(self.openrouter_key)) > 10:
-            for model in ["google/gemini-2.0-flash-001", "meta-llama/llama-3.1-8b-instruct:free"]:
+            logger.info("🔄 Falling back to Layer 3: OpenRouter")
+            models = [
+                "google/gemini-2.0-flash-001",
+                "qwen/qwen-2.5-72b-instruct",
+                "meta-llama/llama-3.1-8b-instruct:free",
+                "qwen/qwen-2.5-32b-instruct",
+                "mistralai/mistral-7b-instruct:free",
+                "google/gemini-flash-1.5-8b"
+            ]
+            for model in models:
                 try:
                     with httpx.Client() as client:
                         resp = client.post(
@@ -144,7 +165,7 @@ class LLMUnderstandingService:
                             headers={"Authorization": f"Bearer {self.openrouter_key}"},
                             json={
                                 "model": model,
-                                "messages": [{"role": "user", "content": prompt}],
+                                "messages": [{"role": "user", "content": prompt + "\nAct as a high-precision extraction expert."}],
                                 "response_format": {"type": "json_object"}
                             },
                             timeout=25.0
@@ -153,9 +174,24 @@ class LLMUnderstandingService:
                             return json.loads(resp.json()["choices"][0]["message"]["content"]), f"OpenRouter:{model}"
                 except Exception: continue
 
-        # ── Layer 4: Local Ollama (Unbeatable) ──
-        for model in ["llama3.2", "llama3", "phi3", "qwen2.5:3b"]:
+        # ── Layer 4: Local Ollama (Unbeatable Reliability) ──
+        logger.info("🔄 Falling back to Layer 4: Local Ollama")
+        # Order: User preference, then Largest/Best models
+        models = [
+            self.settings.model_id, # Respect user-configured model (default qwen2.5vl:3b)
+            "qwen2.5:32b",
+            "qwen2.5:14b",
+            "llama3.1:8b",
+            "qwen2.5:7b",
+            "phi3:14b",
+            "qwen2.5:3b"
+        ]
+        # Remove duplicates while preserving order
+        models = list(dict.fromkeys(models))
+        
+        for model in models:
             try:
+                logger.debug("Trying local model: %s", model)
                 with httpx.Client() as client:
                     resp = client.post(
                         f"{self.ollama_base}/api/chat",
@@ -164,7 +200,7 @@ class LLMUnderstandingService:
                             "messages": [{"role": "user", "content": prompt + "\nOutput valid JSON only."}],
                             "stream": False, "format": "json"
                         },
-                        timeout=30.0
+                        timeout=45.0 # Higher timeout for 32B models
                     )
                     if resp.status_code == 200:
                         return json.loads(resp.json()["message"]["content"]), f"Ollama:{model}"
@@ -197,7 +233,16 @@ class LLMUnderstandingService:
         return {}
 
     def _save_cache(self, cache: dict):
-        SKILL_GRAPH_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+        with self._cache_lock:
+            try:
+                data = json.dumps(cache, indent=2)
+                tmp = SKILL_GRAPH_CACHE_FILE.with_suffix(".tmp")
+                tmp.write_text(data)
+                if os.path.exists(SKILL_GRAPH_CACHE_FILE):
+                    os.remove(SKILL_GRAPH_CACHE_FILE)
+                os.rename(str(tmp), str(SKILL_GRAPH_CACHE_FILE))
+            except Exception as e:
+                logger.warning("Failed to save skill graph cache (Windows lock?): %s", e)
 
 llm_service = LLMUnderstandingService()
 

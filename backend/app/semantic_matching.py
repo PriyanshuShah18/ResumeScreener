@@ -70,7 +70,7 @@ class SemanticMatcher:
         model_name: str = "all-MiniLM-L6-v2",
         semantic_threshold: float = 0.75,
         partial_threshold: float = 0.60,
-        required_match_threshold: float = 0.70,
+        required_match_threshold: float = 0.88,
         additional_relevance_threshold: float = 0.60,
         clustering_threshold: float = 0.78,
         domain_bonus_max: int = 8,
@@ -86,6 +86,8 @@ class SemanticMatcher:
         
         self._model = None
         self._model_lock = threading.Lock()
+        self._embedding_cache: dict[str, Any] = {}
+        self._cache_max = 512
         self.enable_model = enable_model and _HAS_TRANSFORMERS
 
     @property
@@ -310,18 +312,27 @@ class SemanticMatcher:
         try:
             llm_cache = llm_service._load_cache()
             if left_norm in llm_cache and right_norm in [s.lower() for s in llm_cache[left_norm]]:
-                return 1.0
+                return 0.85
             if right_norm in llm_cache and left_norm in [s.lower() for s in llm_cache[right_norm]]:
-                return 1.0
+                return 0.85
         except Exception:
             pass
 
-        # Fallback 2: Sentence-BERT Embeddings
+        # Fallback 2: Sentence-BERT Embeddings (with cache)
         if self.enable_model and self.model:
             try:
-                embeddings = self.model.encode([left_norm, right_norm], convert_to_tensor=True, show_progress_bar=False)
+                def _get_cached_embedding(text):
+                    if text in self._embedding_cache:
+                        return self._embedding_cache[text]
+                    emb = self.model.encode(text, convert_to_tensor=True, show_progress_bar=False)
+                    if len(self._embedding_cache) < self._cache_max:
+                        self._embedding_cache[text] = emb
+                    return emb
+
+                emb_left = _get_cached_embedding(left_norm)
+                emb_right = _get_cached_embedding(right_norm)
                 from sentence_transformers import util
-                semantic_score = float(util.cos_sim(embeddings[0], embeddings[1])[0][0])
+                semantic_score = float(util.cos_sim(emb_left, emb_right)[0][0])
                 return max(lexical_score, semantic_score)
             except Exception:
                 pass
@@ -364,7 +375,7 @@ def get_semantic_matcher() -> SemanticMatcher:
         model_name=os.getenv("SEMANTIC_MODEL_NAME", "all-MiniLM-L6-v2"),
         semantic_threshold=_get_float_env("SEMANTIC_THRESHOLD", 0.75),
         partial_threshold=_get_float_env("SEMANTIC_PARTIAL_THRESHOLD", 0.60),
-        required_match_threshold=_get_float_env("SEMANTIC_REQUIRED_THRESHOLD", 0.70),
+        required_match_threshold=_get_float_env("SEMANTIC_REQUIRED_THRESHOLD", 0.88),
         additional_relevance_threshold=_get_float_env("SEMANTIC_ADDITIONAL_THRESHOLD", 0.60),
         clustering_threshold=_get_float_env("SEMANTIC_CLUSTER_THRESHOLD", 0.78),
         domain_bonus_max=_get_int_env("SEMANTIC_DOMAIN_BONUS_MAX", 8),
