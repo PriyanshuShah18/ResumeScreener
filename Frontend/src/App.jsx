@@ -266,7 +266,7 @@ export default function App() {
             </div>
 
             <label>
-              Candidates to Shortlist
+              Results to Display
               <input
                 type="number"
                 min="1"
@@ -323,7 +323,7 @@ export default function App() {
                       <strong>
                         {item.resume_data.name || item.source_file}
                       </strong>
-                      <p>{item.score.recommendation}</p>
+                      <p>{item.source_file}</p>
                     </div>
                     <div className="shortlist-score">
                       {item.score.total_score}
@@ -378,16 +378,6 @@ export default function App() {
                       {" "}· Total: {selectedResult.score.total_score}/100
                     </p>
                   )}
-
-                  <section className="detail-row">
-                    <h4>Recommendation</h4>
-                    <ResultPill text={selectedResult.score.recommendation} />
-                    {selectedResult.hiring_decision && (
-                      <p className="hiring-decision">
-                        Decision: {selectedResult.hiring_decision}
-                      </p>
-                    )}
-                  </section>
 
                   <section className="detail-row">
                     <h4>Recruiter Feedback</h4>

@@ -236,7 +236,6 @@ async def screen_resumes(
                         resume_data=resume_data,
                         score=candidate_score,
                         recruiter_feedback=recruiter_feedback,
-                        hiring_decision=reasoning_output.hiring_decision,
                         interview_focus_areas=reasoning_output.interview_focus_areas,
                         hidden_strengths=reasoning_output.hidden_strengths,
                         warnings=file_warnings,
@@ -263,23 +262,6 @@ async def screen_resumes(
             warnings.extend(f"{filename}: {w}" for w in outcome.warnings)
 
     results = rank_results(results)
-
-    # Pool-relative recommendation normalization
-    if len(results) >= 3:
-        scores = [r.score.total_score for r in results]
-        mean = sum(scores) / len(scores)
-        std = (sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
-        if std >= 3:  # Only normalize when there's meaningful spread
-            for r in results:
-                z = (r.score.total_score - mean) / max(std, 1.0)
-                if z >= 1.0:
-                    r.score.recommendation = "strong fit (top of pool)"
-                elif z >= 0.25:
-                    r.score.recommendation = "good fit"
-                elif z >= -0.5:
-                    r.score.recommendation = "review"
-                else:
-                    r.score.recommendation = "low fit"
 
     capped_top_k = min(top_k, len(results))
 

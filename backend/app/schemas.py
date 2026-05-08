@@ -398,7 +398,6 @@ class CandidateScore(BaseModel):
     semantic_match_details: dict[str, Any] = Field(default_factory=dict)
     strengths: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
-    recommendation: str = Field(default="low fit")
 
 
 class ScreeningResult(BaseModel):
@@ -406,7 +405,6 @@ class ScreeningResult(BaseModel):
     resume_data: ResumeData
     score: CandidateScore
     recruiter_feedback: str = Field(default="", description="Short recruiter-style summary")
-    hiring_decision: str = Field(default="", description="Model- or heuristic-generated hiring decision")
     interview_focus_areas: list[str] = Field(default_factory=list)
     hidden_strengths: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

@@ -78,7 +78,7 @@ pnpm-debug.log*
 Frontend/.env*
 !Frontend/.env.example
 backend/.env*
-backend/.env.example
+!backend/.env.example
 *.pem
 *.key
 *.crt
@@ -117,6 +117,9 @@ tmp/
 # -------------------------
 backend/tests/
 tests/
+!backend/tests/
+backend/tests/*
+!backend/tests/test_ats_*.py
 backend/HR.md
 backend/*WALKTHROUGH*.md
 
@@ -128,6 +131,7 @@ backend/*WALKTHROUGH*.md
 PROJECT_CHANGE_LOG.md
 
 .env.example
+!backend/.env.example
 HR.md
 HR_WALKTHROUGH.md
 test_generation.py
@@ -136,3 +140,6 @@ test_generation.py
 skill_graph_cache.json
 backend/skill_graph_cache.json
 backend/test_image_upload.py
+
+backend/tests/
+docs/
