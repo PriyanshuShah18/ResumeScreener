@@ -37,7 +37,10 @@ class ATSMongoRepository:
         collection.create_index(spec, **kwargs)
 
     def score_log_exists(self, application_id: str) -> bool:
-        return bool(self.logs.find_one({"applicationId": application_id, "stage": "SCORE"}))
+        log = self.logs.find_one({"applicationId": application_id, "stage": "SCORE"})
+        if not log:
+            return False
+        return (log.get("details") or {}).get("status") != "FAILED"
 
     def fetch_pending_applications(self, limit: int, status: str = "APPLIED") -> list[dict[str, Any]]:
         pending: list[dict[str, Any]] = []
@@ -73,6 +76,10 @@ class ATSMongoRepository:
         return None
 
     def insert_score_log(self, log_doc: dict[str, Any]) -> Any:
+        query = {"applicationId": log_doc.get("applicationId"), "stage": log_doc.get("stage")}
+        if query["applicationId"] and query["stage"] and hasattr(self.logs, "replace_one"):
+            result = self.logs.replace_one(query, log_doc, upsert=True)
+            return result.upserted_id
         return self.logs.insert_one(log_doc).inserted_id
 
     def cache_candidate_parsed_resume(self, candidate_id: str, parsed_json: dict[str, Any]) -> None:
@@ -80,6 +87,13 @@ class ATSMongoRepository:
             {"candidateId": candidate_id},
             {"$set": {"latestResume.parsedJson": parsed_json}},
         )
+
+    def clear_candidate_parsed_resume_cache(self) -> int:
+        result = self.candidates.update_many(
+            {"latestResume.parsedJson": {"$exists": True}},
+            {"$unset": {"latestResume.parsedJson": ""}},
+        )
+        return int(getattr(result, "modified_count", 0) or 0)
 
     def update_application_status(self, application_id: str, status: str) -> None:
         self.applications.update_one(

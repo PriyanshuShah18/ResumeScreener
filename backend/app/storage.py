@@ -15,6 +15,26 @@ class StoredResume:
     content: bytes
 
 
+class ResumeDeletedError(FileNotFoundError):
+    def __init__(self, storage_key: str):
+        self.storage_key = storage_key
+        super().__init__(f"Resume object not found in S3: {storage_key}")
+
+
+def _is_missing_s3_object_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+
+    error = response.get("Error") or {}
+    code = str(error.get("Code") or "").strip()
+    if code in {"NoSuchKey", "NoSuchVersion", "NotFound", "404"}:
+        return True
+
+    metadata = response.get("ResponseMetadata") or {}
+    return metadata.get("HTTPStatusCode") == 404
+
+
 class S3ResumeStorage:
     def __init__(self, settings: ATSSettings, client: Any | None = None):
         self.settings = settings
@@ -42,7 +62,12 @@ class S3ResumeStorage:
 
         file_name = str(latest_resume.get("fileName") or "").strip() or Path(storage_key).name or "resume"
         mime_type = str(latest_resume.get("mimeType") or "").strip() or "application/octet-stream"
-        response = self.client.get_object(Bucket=self.settings.s3_bucket, Key=storage_key)
+        try:
+            response = self.client.get_object(Bucket=self.settings.s3_bucket, Key=storage_key)
+        except Exception as exc:
+            if _is_missing_s3_object_error(exc):
+                raise ResumeDeletedError(storage_key) from exc
+            raise
         content = response["Body"].read()
 
         return StoredResume(
