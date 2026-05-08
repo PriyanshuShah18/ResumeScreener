@@ -74,7 +74,7 @@ def ownership_ratio(highlights: list[str]) -> float:
     return ownership_count / total
 
 
-def extract_phrases(value: str, limit: int = 15) -> list[str]:
+def extract_phrases(value: str, limit: int = 15, max_tokens: int = 4) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
     for chunk in re.split(r"[\n,;/|]+", value):
@@ -82,7 +82,7 @@ def extract_phrases(value: str, limit: int = 15) -> list[str]:
         if not cleaned or cleaned in seen:
             continue
         token_count = len(cleaned.split())
-        if token_count == 0 or token_count > 4:
+        if token_count == 0 or token_count > max_tokens:
             continue
         if cleaned in SKILL_NOISE:
             continue
@@ -224,15 +224,65 @@ def experience_domain_terms(resume: ResumeData) -> list[str]:
     return sorted(terms)
 
 
+def _append_unique(target: list[str], values: list[str]) -> None:
+    seen = set(target)
+    for value in values:
+        normalized = normalize_skill(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        target.append(normalized)
+
+
+def _education_entry_terms(entry: Any) -> list[str]:
+    terms: list[str] = []
+    degree = normalize_skill(entry.degree)
+    field = normalize_skill(entry.field_of_study)
+    institution = normalize_skill(entry.institution)
+
+    for value in (degree, field, institution):
+        _append_unique(terms, extract_phrases(value, limit=12, max_tokens=8))
+
+    if degree and field:
+        _append_unique(terms, [f"{degree} {field}"])
+
+    combined = normalize_skill(f"{entry.degree} {entry.field_of_study} {entry.institution}")
+    _append_unique(terms, extract_phrases(combined, limit=12, max_tokens=10))
+
+    has_bachelor = any(token in degree for token in ("b.tech", "b.e", "bachelor", "bachelors"))
+    has_master = any(token in degree for token in ("m.tech", "m.e", "master", "masters", "msc", "m.sc"))
+
+    if "cse" in field:
+        _append_unique(terms, ["computer science", "computer science engineering"])
+    if "ai" in field.split() or "artificial intelligence" in field:
+        _append_unique(terms, ["artificial intelligence"])
+
+    if has_bachelor:
+        bachelor_terms = ["bachelor", "b.tech", "bachelor of technology", "bachelor of engineering"]
+        if field:
+            bachelor_terms.extend([f"b.tech {field}", f"bachelor {field}"])
+        if "computer science" in field:
+            bachelor_terms.extend(["b.tech computer science", "bachelor computer science"])
+        _append_unique(terms, bachelor_terms)
+
+    if has_master:
+        master_terms = ["master", "m.tech", "master of technology", "master of engineering"]
+        if field:
+            master_terms.extend([f"m.tech {field}", f"master {field}"])
+        if "artificial intelligence" in field:
+            master_terms.extend(["m.tech artificial intelligence", "master artificial intelligence"])
+        _append_unique(terms, master_terms)
+
+    return terms
+
+
 def education_ratio(job: JobDescriptionData, resume: ResumeData, matcher: SemanticMatcher) -> float:
     criteria: list[float] = []
 
     if job.required_education:
         resume_education_terms = []
         for entry in resume.education_entries:
-            resume_education_terms.extend(
-                extract_phrases(f"{entry.degree} {entry.field_of_study} {entry.institution}", limit=12)
-            )
+            resume_education_terms.extend(_education_entry_terms(entry))
         score = semantic_coverage(list(normalize_set(job.required_education)), resume_education_terms, matcher)
         criteria.append(score)
 
@@ -264,18 +314,6 @@ def score_budget(job: JobDescriptionData) -> dict[str, int]:
     if "finance" in archetype:
         return {"skills": 25, "experience": 30, "education": 25, "keyword": 15, "completeness": 5}
     return {"skills": 40, "experience": 30, "education": 15, "keyword": 10, "completeness": 5}
-
-
-def recommendation(total_score: int, risk_score: int) -> str:
-    if risk_score >= 60:
-        return "low fit"
-    if total_score >= 85 and risk_score < 35:
-        return "strong fit"
-    if total_score >= 70 and risk_score < 55:
-        return "good fit"
-    if total_score >= 50 and risk_score < 60:
-        return "review"
-    return "low fit"
 
 
 def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateScore:
@@ -567,7 +605,6 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         semantic_match_details=semantic_details,
         strengths=strengths,
         risks=risks,
-        recommendation=recommendation(total_score, risk_score),
     )
 
 
@@ -580,7 +617,7 @@ def build_recruiter_feedback(
     if reasoning_summary.strip():
         return reasoning_summary.strip()
 
-    headline = f"{resume.name or 'Candidate'} is a {score.recommendation} for {job.title or 'the role'}."
+    headline = f"{resume.name or 'Candidate'} was scored for {job.title or 'the role'} with a total score of {score.total_score}/100."
     notes = score.strengths[:2] + score.risks[:2]
     if not notes:
         notes = ["Profile was processed successfully but surfaced limited structured evidence."]

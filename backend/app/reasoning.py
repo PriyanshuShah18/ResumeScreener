@@ -9,21 +9,12 @@ from app.schemas import CandidateScore, JobDescriptionData, ResumeData
 
 
 class ReasoningOutput(BaseModel):
-    hiring_decision: str = Field(default="")
     fit_rationale: str = Field(default="")
     interview_focus_areas: list[str] = Field(default_factory=list)
     hidden_strengths: list[str] = Field(default_factory=list)
 
 
 def fallback_reasoning(job: JobDescriptionData, resume: ResumeData, score: CandidateScore) -> ReasoningOutput:
-    decision_map = {
-        "strong fit": "proceed to interview",
-        "good fit": "interview shortlist",
-        "review": "manual recruiter review",
-        "low fit": "hold",
-    }
-    hiring_decision = decision_map.get(score.recommendation, "manual recruiter review")
-
     focus_areas: list[str] = []
     if score.critical_missing_skills:
         focus_areas.append(f"Validate missing critical skills: {', '.join(score.critical_missing_skills[:4])}")
@@ -37,7 +28,7 @@ def fallback_reasoning(job: JobDescriptionData, resume: ResumeData, score: Candi
         hidden_strengths.append("Project work indicates practical delivery experience.")
 
     rationale_parts = [
-        f"{resume.name or 'Candidate'} is a {score.recommendation} for {job.title or 'the role'}.",
+        f"{resume.name or 'Candidate'} was scored for {job.title or 'the role'} with a total score of {score.total_score}/100.",
     ]
     if score.strengths:
         rationale_parts.append("Strengths: " + " ".join(score.strengths[:2]))
@@ -45,7 +36,6 @@ def fallback_reasoning(job: JobDescriptionData, resume: ResumeData, score: Candi
         rationale_parts.append("Risks: " + " ".join(score.risks[:2]))
 
     return ReasoningOutput(
-        hiring_decision=hiring_decision,
         fit_rationale=" ".join(part for part in rationale_parts if part).strip(),
         interview_focus_areas=focus_areas[:4],
         hidden_strengths=hidden_strengths[:4],
@@ -57,12 +47,12 @@ def build_reasoning_prompt(job: JobDescriptionData, resume: ResumeData, score: C
     return (
         "You are an expert technical HR reasoning assistant. Return valid JSON only that matches this schema: "
         f"{json.dumps(schema_json)}. "
-        "Use the score and structured data to give a clear hiring decision, concise rationale, interview focus areas, "
-        "and hidden strengths.\n\n"
+        "Use the score and structured data to give a concise rationale, interview focus areas, and hidden strengths. "
+        "Do not make or imply any selection outcome. The HR team will decide separately.\n\n"
         "**CRITICAL REASONING & CONTEXT RULES:**\n"
         "1. **Evaluate Modern Equivalents:** If a required skill is missing, actively check 'additional_relevant_skills'. "
         "If the candidate possesses highly synergistic or modern equivalents (e.g., Langchain/Generative AI for an ML role, "
-        "or Next.js for a React role), HIGHLIGHT this as a strong compensatory factor and adjust the hiring decision positively.\n"
+        "or Next.js for a React role), HIGHLIGHT this as a strong compensatory factor in the rationale.\n"
         "2. **Strict Anti-Hallucination:** DO NOT invent skills. DO NOT claim unrelated skills are 'essential'. "
         "For example, if testing a React Native role, possessing Python/Java is NOT relevant frontend experience. "
         "Do not falsely compensate with functionally unrelated tech.\n"
@@ -88,12 +78,22 @@ def generate_reasoning(
 ) -> ReasoningOutput:
     """Generate hiring reasoning from scored data.
     """
-    if not llm_service.enabled:
+    prompt = build_reasoning_prompt(job, resume, score)
+
+    if model_client is not None and getattr(model_client, "model_available", False):
+        if hasattr(model_client, "generate_response") and hasattr(model_client, "parse_json"):
+            try:
+                raw_response = model_client.generate_response([{"role": "user", "content": prompt}])
+                result = model_client.parse_json(raw_response)
+            except Exception:
+                result = None
+        else:
+            result = None
+    elif llm_service.enabled:
+        result, _ = llm_service._generate_json(prompt, {})
+    else:
         return fallback_reasoning(job, resume, score)
 
-    prompt = build_reasoning_prompt(job, resume, score)
-    result, _ = llm_service._generate_json(prompt, {})
-    
     if not result:
         return fallback_reasoning(job, resume, score)
 
@@ -103,7 +103,6 @@ def generate_reasoning(
         # LLM returned malformed data — use what we can, fall back for the rest
         fb = fallback_reasoning(job, resume, score)
         return ReasoningOutput(
-            hiring_decision=result.get("hiring_decision", fb.hiring_decision),
             fit_rationale=result.get("fit_rationale", fb.fit_rationale),
             interview_focus_areas=result.get("interview_focus_areas", fb.interview_focus_areas) if isinstance(result.get("interview_focus_areas"), list) else fb.interview_focus_areas,
             hidden_strengths=result.get("hidden_strengths", fb.hidden_strengths) if isinstance(result.get("hidden_strengths"), list) else fb.hidden_strengths,

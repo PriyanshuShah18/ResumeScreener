@@ -142,7 +142,8 @@ class SemanticMatcher:
 
         # Dynamically populate the skill graph cache for any unseen skills
         all_skills = list(set(normalized_jd + normalized_resume))
-        if all_skills:
+        skill_graph_default = _get_bool_env("SEMANTIC_MODEL_ENABLED", True)
+        if all_skills and _get_bool_env("SEMANTIC_SKILL_GRAPH_ENABLED", skill_graph_default):
             from app.llm_understanding import llm_service
             try:
                 llm_service.generate_skill_graph(all_skills)
@@ -379,4 +380,5 @@ def get_semantic_matcher() -> SemanticMatcher:
         additional_relevance_threshold=_get_float_env("SEMANTIC_ADDITIONAL_THRESHOLD", 0.60),
         clustering_threshold=_get_float_env("SEMANTIC_CLUSTER_THRESHOLD", 0.78),
         domain_bonus_max=_get_int_env("SEMANTIC_DOMAIN_BONUS_MAX", 8),
+        enable_model=_get_bool_env("SEMANTIC_MODEL_ENABLED", True),
     )

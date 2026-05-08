@@ -26,6 +26,13 @@ except ImportError:
 SKILL_GRAPH_CACHE_FILE = Path(__file__).resolve().parent.parent / "skill_graph_cache.json"
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class _RateLimiter:
     """Sliding-window rate limiter."""
     def __init__(self, max_calls: int, window_seconds: float):
@@ -52,9 +59,18 @@ class LLMUnderstandingService:
         self.settings = get_settings()
         self.enabled = False
         self._cache_lock = threading.Lock()
+        self.groq_client = None
+        self.gemini_model = None
+        self.openrouter_key = None
+        self.ollama_base = str(self.settings.ollama_base_url).rstrip("/")
+        self._groq_limiter = _RateLimiter(max_calls=25, window_seconds=60.0)
+        self._gemini_limiter = _RateLimiter(max_calls=4, window_seconds=60.0)
+
+        if not _get_bool_env("LLM_UNDERSTANDING_ENABLED", True):
+            logger.info("LLM understanding service disabled by LLM_UNDERSTANDING_ENABLED")
+            return
 
         # ── 1. Groq (Fastest) ──
-        self.groq_client = None
         if self.settings.groq_api_key and Groq:
             try:
                 self.groq_client = Groq(
@@ -65,11 +81,7 @@ class LLMUnderstandingService:
                 logger.info("✅ Groq initialized")
             except Exception: pass
 
-        self._groq_limiter = _RateLimiter(max_calls=25, window_seconds=60.0)
-
         # ── 2. Gemini Direct ──
-        self.gemini_model = None
-        self._gemini_limiter = _RateLimiter(max_calls=4, window_seconds=60.0)
         if self.settings.gemini_api_key and genai:
             try:
                 genai.configure(api_key=self.settings.gemini_api_key)
@@ -85,7 +97,6 @@ class LLMUnderstandingService:
             logger.info("✅ OpenRouter initialized")
 
         # ── 4. Local Ollama ──
-        self.ollama_base = str(self.settings.ollama_base_url).rstrip("/")
         if self.ollama_base:
             self.enabled = True
             logger.info("✅ Local Ollama Fallback active at %s", self.ollama_base)
@@ -116,6 +127,9 @@ class LLMUnderstandingService:
         return res
 
     def _generate_json(self, prompt: str, default: Any) -> tuple[Any, str]:
+        if not self.enabled:
+            return default, "Disabled"
+
         # ── Layer 1: Groq (Tiered: 70B then Qwen then 8B) ──
         if self.groq_client and self._groq_limiter.acquire():
             for model in ["llama-3.3-70b-versatile", "qwen-2.5-32b", "llama-3.1-8b-instant"]:
@@ -210,6 +224,8 @@ class LLMUnderstandingService:
 
     def generate_skill_graph(self, skills: list[str]) -> dict[str, list[str]]:
         if not skills: return {}
+        if not self.enabled:
+            return {s: [s] for s in skills}
         cache = self._load_cache()
         uncached = [s for s in skills if s not in cache]
         if not uncached: return {s: cache[s] for s in skills if s in cache}
