@@ -16,10 +16,6 @@ NOISY_DEPENDENCY_LOGGERS = (
     "huggingface_hub",
     "transformers",
 )
-VERBOSE_WORKER_LOGGERS = (
-    "app.agent",
-    "app.llm_understanding",
-)
 
 
 def _suppress_noisy_worker_warnings() -> None:
@@ -40,7 +36,7 @@ def _suppress_noisy_worker_warnings() -> None:
 def _configure_worker_logging() -> None:
     _suppress_noisy_worker_warnings()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    for logger_name in NOISY_DEPENDENCY_LOGGERS + VERBOSE_WORKER_LOGGERS:
+    for logger_name in NOISY_DEPENDENCY_LOGGERS:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
@@ -53,7 +49,7 @@ from app.config import get_settings
 from app.document_parser import DocumentParser
 from app.schemas import CandidateScore, JobDescriptionData, ResumeData, normalize_skill, normalize_whitespace
 from app.scoring import score_candidate
-from app.storage import S3ResumeStorage
+from app.storage import ResumeDeletedError, S3ResumeStorage
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +75,13 @@ ATS_STOPWORDS = {
     "modern",
     "applications",
 }
+
+
+class DeletedApplicationError(Exception):
+    def __init__(self, reason: str, deleted_entity: str, details: dict[str, Any] | None = None):
+        self.deleted_entity = deleted_entity
+        self.details = details or {}
+        super().__init__(reason)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -331,16 +334,30 @@ class ATSWorker:
         self.settings = settings
 
     def process_once(self) -> dict[str, int]:
+        logger.info(
+            "Mongo fetch pending applications: status=%s limit=%d",
+            self.settings.applied_status,
+            self.settings.batch_size,
+        )
         applications = self.repo.fetch_pending_applications(
             limit=self.settings.batch_size,
             status=self.settings.applied_status,
         )
-        summary = {"found": len(applications), "processed": 0, "failed": 0}
+        logger.info("Mongo fetch pending applications complete: found=%d", len(applications))
+        summary = {"found": len(applications), "processed": 0, "failed": 0, "deleted": 0}
 
         for application in applications:
             try:
                 self.process_application(application)
                 summary["processed"] += 1
+            except DeletedApplicationError as exc:
+                logger.warning(
+                    "ATS scoring skipped for deleted application %s: %s",
+                    application.get("applicationId"),
+                    exc,
+                )
+                self._insert_deleted_log(application, exc)
+                summary["deleted"] += 1
             except Exception as exc:
                 logger.exception("ATS scoring failed for application %s", application.get("applicationId"))
                 self._insert_failure_log(application, exc)
@@ -359,10 +376,18 @@ class ATSWorker:
         if not job_id:
             raise ValueError(f"jobId is required for application {application_id}")
 
+        logger.info("Mongo fetch candidate: candidateId=%s applicationId=%s", candidate_id, application_id)
         candidate = self.repo.get_candidate(candidate_id)
+        logger.info("Mongo fetch candidate complete: candidateId=%s found=%s", candidate_id, bool(candidate))
         if not candidate:
-            raise ValueError(f"Candidate not found for candidateId={candidate_id}")
+            raise DeletedApplicationError(
+                f"Candidate not found for candidateId={candidate_id}",
+                deleted_entity="candidate",
+                details={"candidateId": candidate_id},
+            )
+        logger.info("Mongo fetch job: jobId=%s applicationId=%s", job_id, application_id)
         job = self.repo.get_job(job_id)
+        logger.info("Mongo fetch job complete: jobId=%s found=%s", job_id, bool(job))
         if not job:
             raise ValueError(f"Job not found for jobId={job_id}")
 
@@ -373,7 +398,35 @@ class ATSWorker:
         parsed_resume: Any = parsed_json
 
         if not parsed_json:
-            stored_resume = self.storage.download_resume(latest_resume)
+            logger.info(
+                "Mongo resume cache miss: candidateId=%s applicationId=%s",
+                candidate_id,
+                application_id,
+            )
+            logger.info(
+                "S3 fetch resume: candidateId=%s storageKey=%s fileName=%s",
+                candidate_id,
+                latest_resume.get("storageKey"),
+                latest_resume.get("fileName"),
+            )
+            try:
+                stored_resume = self.storage.download_resume(latest_resume)
+            except (ResumeDeletedError, FileNotFoundError) as exc:
+                raise DeletedApplicationError(
+                    str(exc),
+                    deleted_entity="resume",
+                    details={
+                        "resumeSource": "s3",
+                        "resumeStorageKey": latest_resume.get("storageKey"),
+                        "resumeFileName": latest_resume.get("fileName"),
+                    },
+                ) from exc
+            logger.info(
+                "S3 fetch resume complete: candidateId=%s storageKey=%s bytes=%d",
+                candidate_id,
+                stored_resume.storage_key,
+                len(stored_resume.content),
+            )
             parsed_document = self.document_parser.parse_upload(stored_resume.file_name, stored_resume.content)
             warnings.extend(parsed_document.warnings)
             extracted_resume = self.extraction_service.extract_resume(
@@ -382,7 +435,17 @@ class ATSWorker:
             )
             parsed_resume = extracted_resume
             if self.settings.cache_parsed_json:
+                logger.info("Mongo write parsed resume cache: candidateId=%s", candidate_id)
                 self.repo.cache_candidate_parsed_resume(candidate_id, extracted_resume.model_dump())
+                logger.info("Mongo write parsed resume cache complete: candidateId=%s", candidate_id)
+            else:
+                logger.info("Mongo parsed resume cache disabled: candidateId=%s", candidate_id)
+        else:
+            logger.info(
+                "Mongo resume cache hit: candidateId=%s applicationId=%s",
+                candidate_id,
+                application_id,
+            )
 
         job_data = _job_from_hrms_with_extraction(job, self.extraction_service)
         resume_data = _resume_from_hrms_candidate(candidate, parsed_resume)
@@ -404,9 +467,36 @@ class ATSWorker:
             created_by=self.settings.created_by,
             created_by_name=self.settings.created_by_name,
         )
-        self.repo.insert_score_log(log_doc)
+        self._write_score_log(log_doc)
 
         return log_doc
+
+    def _insert_deleted_log(self, application: dict[str, Any], exc: DeletedApplicationError) -> None:
+        details = {
+            "status": "DELETED",
+            "deletedEntity": exc.deleted_entity,
+            "reason": str(exc),
+            "warnings": [str(exc)],
+            "applicationStatus": application.get("status"),
+        }
+        details.update(
+            {
+                key: value
+                for key, value in exc.details.items()
+                if value not in (None, "")
+            }
+        )
+        log_doc = _build_ats_log(
+            organization_id=self.settings.organization_id,
+            application=application,
+            score=0,
+            details=details,
+            stage=self.settings.score_stage,
+            created_at_iso=datetime.now(timezone.utc).isoformat(),
+            created_by=self.settings.created_by,
+            created_by_name=self.settings.created_by_name,
+        )
+        self._write_score_log(log_doc)
 
     def _insert_failure_log(self, application: dict[str, Any], exc: Exception) -> None:
         log_doc = _build_ats_log(
@@ -423,7 +513,23 @@ class ATSWorker:
             created_by=self.settings.created_by,
             created_by_name=self.settings.created_by_name,
         )
-        self.repo.insert_score_log(log_doc)
+        self._write_score_log(log_doc)
+
+    def _write_score_log(self, log_doc: dict[str, Any]) -> Any:
+        details = log_doc.get("details") or {}
+        logger.info(
+            "Mongo write ATS score log: applicationId=%s stage=%s score=%s status=%s",
+            log_doc.get("applicationId"),
+            log_doc.get("stage"),
+            log_doc.get("score"),
+            details.get("status", "SCORED"),
+        )
+        result = self.repo.insert_score_log(log_doc)
+        logger.info(
+            "Mongo write ATS score log complete: applicationId=%s",
+            log_doc.get("applicationId"),
+        )
+        return result
 
 
 def create_worker(settings: ATSSettings | None = None) -> ATSWorker:
@@ -446,20 +552,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the HRMS ATS scoring worker")
     parser.add_argument("--once", action="store_true", help="Process one batch and exit")
     parser.add_argument("--ensure-indexes", action="store_true", help="Create recommended MongoDB indexes before processing")
+    parser.add_argument(
+        "--clear-parsed-cache",
+        action="store_true",
+        help="Unset cached latestResume.parsedJson documents before processing",
+    )
     args = parser.parse_args()
 
     _configure_worker_logging()
     worker = create_worker()
     if args.ensure_indexes:
         worker.repo.ensure_indexes()
+    if args.clear_parsed_cache:
+        cleared_count = worker.repo.clear_candidate_parsed_resume_cache()
+        logger.info("Mongo cleared parsed resume cache: candidates=%d", cleared_count)
 
     while True:
         summary = worker.process_once()
         logger.info(
-            "ATS worker batch complete: found=%d processed=%d failed=%d",
+            "ATS worker batch complete: found=%d processed=%d failed=%d deleted=%d",
             summary["found"],
             summary["processed"],
             summary["failed"],
+            summary.get("deleted", 0),
         )
         if args.once:
             break

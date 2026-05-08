@@ -36,7 +36,7 @@ class ATSSettings:
     batch_size: int = 25
     auto_shortlist: bool = False
     shortlist_threshold: int = 80
-    cache_parsed_json: bool = True
+    cache_parsed_json: bool = False
     applied_status: str = "APPLIED"
     shortlisted_status: str = "SHORTLISTED"
     score_stage: str = "SCORE"
@@ -68,5 +68,5 @@ def get_ats_settings() -> ATSSettings:
         batch_size=_get_int("ATS_BATCH_SIZE", 25, minimum=1),
         auto_shortlist=_get_bool("ATS_AUTO_SHORTLIST", False),
         shortlist_threshold=_get_int("ATS_SHORTLIST_THRESHOLD", 80, minimum=0),
-        cache_parsed_json=_get_bool("ATS_CACHE_PARSED_JSON", True),
+        cache_parsed_json=_get_bool("ATS_CACHE_PARSED_JSON", False),
     )
