@@ -6,26 +6,33 @@ from app.ats_settings import ATSSettings
 
 
 class ATSMongoRepository:
+    """
+    Unified repository: all ATS reads and writes go to hrmsjobapplications.
+    The separate hrmsatslogs collection is retired.
+    """
+
     def __init__(self, db: Any):
         self.db = db
         self.applications = db["hrmsjobapplications"]
         self.candidates = db["hrmscandidates"]
         self.jobs = db["hrmsjobs"]
-        self.logs = db["hrmsatslogs"]
 
     @classmethod
     def from_settings(cls, settings: ATSSettings) -> "ATSMongoRepository":
         try:
             from pymongo import MongoClient
-        except ImportError as exc:  # pragma: no cover - depends on deployment env
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError("pymongo is required for the ATS worker") from exc
 
         client = MongoClient(settings.require_mongodb_uri())
         return cls(client[settings.mongodb_db])
 
     def ensure_indexes(self) -> None:
-        self._ensure_index(self.applications, [("status", 1), ("applicationId", 1)])
-        self._ensure_index(self.logs, [("applicationId", 1), ("stage", 1)], unique=True)
+        """Create recommended indexes for efficient polling."""
+        self._ensure_index(
+            self.applications,
+            [("atsProcessed", 1), ("status", 1)],
+        )
         self._ensure_index(self.candidates, [("candidateId", 1)])
         self._ensure_index(self.jobs, [("jobId", 1)])
 
@@ -36,22 +43,18 @@ class ATSMongoRepository:
                 return
         collection.create_index(spec, **kwargs)
 
-    def score_log_exists(self, application_id: str) -> bool:
-        log = self.logs.find_one({"applicationId": application_id, "stage": "SCORE"})
-        if not log:
-            return False
-        return (log.get("details") or {}).get("status") != "FAILED"
+    # ── Read ────────────────────────────────────────────────────────────────
 
     def fetch_pending_applications(self, limit: int, status: str = "APPLIED") -> list[dict[str, Any]]:
-        pending: list[dict[str, Any]] = []
-        for application in self.applications.find({"status": status}):
-            application_id = application.get("applicationId")
-            if not application_id or self.score_log_exists(application_id):
-                continue
-            pending.append(application)
-            if len(pending) >= limit:
-                break
-        return pending
+        """
+        Return unprocessed applications in APPLIED status.
+        Filter: atsProcessed == False AND status == "APPLIED"
+        """
+        cursor = self.applications.find(
+            {"atsProcessed": False, "status": status},
+            limit=limit,
+        )
+        return list(cursor)
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         return self.candidates.find_one({"candidateId": candidate_id})
@@ -61,9 +64,10 @@ class ATSMongoRepository:
         if job:
             return job
 
+        # Fallback: try by MongoDB _id
         try:
             from bson import ObjectId
-        except ImportError:  # pragma: no cover - pymongo provides bson in deployment
+        except ImportError:  # pragma: no cover
             return None
 
         if isinstance(job_id, ObjectId):
@@ -75,14 +79,34 @@ class ATSMongoRepository:
 
         return None
 
-    def insert_score_log(self, log_doc: dict[str, Any]) -> Any:
-        query = {"applicationId": log_doc.get("applicationId"), "stage": log_doc.get("stage")}
-        if query["applicationId"] and query["stage"] and hasattr(self.logs, "replace_one"):
-            result = self.logs.replace_one(query, log_doc, upsert=True)
-            return result.upserted_id
-        return self.logs.insert_one(log_doc).inserted_id
+    # ── Write ───────────────────────────────────────────────────────────────
+
+    def write_ats_result(
+        self,
+        doc_id: Any,
+        score: int,
+        details: dict[str, Any],
+    ) -> None:
+        """
+        Write the ATS score back to the application document.
+        Sets atsProcessed=True so the frontend ATS page can display it.
+        """
+        from datetime import datetime, timezone
+
+        self.applications.update_one(
+            {"_id": doc_id},
+            {
+                "$set": {
+                    "atsProcessed": True,
+                    "atsScore": score,
+                    "atsProcessedAt": datetime.now(timezone.utc),
+                    "atsDetails": details,
+                }
+            },
+        )
 
     def cache_candidate_parsed_resume(self, candidate_id: str, parsed_json: dict[str, Any]) -> None:
+        """Cache the expensive LLM-parsed resume JSON on the candidate document."""
         self.candidates.update_one(
             {"candidateId": candidate_id},
             {"$set": {"latestResume.parsedJson": parsed_json}},
@@ -94,9 +118,3 @@ class ATSMongoRepository:
             {"$unset": {"latestResume.parsedJson": ""}},
         )
         return int(getattr(result, "modified_count", 0) or 0)
-
-    def update_application_status(self, application_id: str, status: str) -> None:
-        self.applications.update_one(
-            {"applicationId": application_id},
-            {"$set": {"status": status}},
-        )

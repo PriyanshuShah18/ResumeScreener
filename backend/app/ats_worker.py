@@ -206,8 +206,9 @@ def _resume_json_from_candidate(candidate_doc: dict[str, Any], parsed_json: Any 
             return dict(parsed_json["resume_data"])
         return dict(parsed_json)
 
-    latest_resume = candidate_doc.get("latestResume") or {}
-    candidate_parsed = latest_resume.get("parsedJson")
+    # Fallback: try cached parsedJson on candidate doc (supports both key names)
+    resume_block = candidate_doc.get("resume") or candidate_doc.get("latestResume") or {}
+    candidate_parsed = resume_block.get("parsedJson")
     if isinstance(candidate_parsed, dict):
         return dict(candidate_parsed)
     return {}
@@ -257,65 +258,60 @@ def _dimension_percent(value: int, budget: int | None) -> int:
     return round(min(max(value / budget, 0.0), 1.0) * 100)
 
 
+def _make_decision(score: int, shortlist_threshold: int = 80) -> str:
+    """Map a raw score to the decision string expected by the frontend."""
+    if score >= shortlist_threshold:
+        return "SHORTLISTED"
+    return "REJECTED"
+
+
 def _score_details(
     job_data: JobDescriptionData,
     resume_data: ResumeData,
     candidate_score: CandidateScore,
+    shortlist_threshold: int = 80,
     warnings: list[str] | None = None,
+    resume_source: str = "s3",
+    resume_storage_key: str | None = None,
+    resume_file_name: str | None = None,
 ) -> dict[str, Any]:
+    """Build the atsDetails payload written directly onto the application document."""
     budgets = candidate_score.budgets or {}
-    return {
-        "jobTitle": job_data.title,
+    decision = _make_decision(candidate_score.total_score, shortlist_threshold)
+    details: dict[str, Any] = {
+        # --- Core metrics ---
         "skillMatchPercent": _dimension_percent(candidate_score.skills_score, budgets.get("skills")),
         "experienceMatchPercent": _dimension_percent(candidate_score.experience_score, budgets.get("experience")),
         "educationMatchPercent": _dimension_percent(candidate_score.education_score, budgets.get("education")),
-        "keywordMatchPercent": _dimension_percent(candidate_score.keyword_score, budgets.get("keyword")),
         "completenessPercent": _dimension_percent(candidate_score.completeness_score, budgets.get("completeness")),
+        # --- Decision (required for ATS page) ---
+        "decision": decision,
+        "recommendation": decision,
+        # --- Candidate context ---
         "candidateExperienceYears": resume_data.total_years_experience,
         "requiredExperienceYears": job_data.min_years_experience,
+        # --- Skills breakdown ---
         "matchedSkills": candidate_score.matched_skills,
         "missingSkills": candidate_score.missing_skills,
-        "criticalMissingSkills": candidate_score.critical_missing_skills,
         "additionalRelevantSkills": candidate_score.additional_relevant_skills,
-        "detectedDomainTags": candidate_score.detected_domain_tags,
-        "skillsScore": candidate_score.skills_score,
-        "experienceScore": candidate_score.experience_score,
-        "educationScore": candidate_score.education_score,
-        "keywordScore": candidate_score.keyword_score,
-        "completenessScore": candidate_score.completeness_score,
-        "confidenceScore": candidate_score.confidence_score,
-        "riskScore": candidate_score.risk_score,
+        # --- Narrative ---
         "strengths": candidate_score.strengths,
         "risks": candidate_score.risks,
-        "budgets": budgets,
+        # --- Optional / debug ---
+        "duplicateReason": None,
+        "resumeSource": resume_source,
+        "criticalMissingSkills": candidate_score.critical_missing_skills,
+        "detectedDomainTags": candidate_score.detected_domain_tags,
+        "confidenceScore": candidate_score.confidence_score,
+        "riskScore": candidate_score.risk_score,
         "semanticMatchDetails": candidate_score.semantic_match_details,
         "warnings": warnings or [],
     }
-
-
-def _build_ats_log(
-    organization_id: str,
-    application: dict[str, Any],
-    score: int,
-    details: dict[str, Any],
-    stage: str = "SCORE",
-    created_at_iso: str | None = None,
-    created_by: str = "ats-engine",
-    created_by_name: str = "ATS Service",
-) -> dict[str, Any]:
-    created_at = created_at_iso or datetime.now(timezone.utc).isoformat()
-    return {
-        "organizationId": organization_id,
-        "jobId": application.get("jobId"),
-        "candidateId": application.get("candidateId"),
-        "applicationId": application.get("applicationId"),
-        "stage": stage,
-        "score": score,
-        "details": details,
-        "createdBy": created_by,
-        "createdByName": created_by_name,
-        "createdAt": created_at,
-    }
+    if resume_storage_key:
+        details["resumeStorageKey"] = resume_storage_key
+    if resume_file_name:
+        details["resumeFileName"] = resume_file_name
+    return details
 
 
 class ATSWorker:
@@ -391,34 +387,35 @@ class ATSWorker:
         if not job:
             raise ValueError(f"Job not found for jobId={job_id}")
 
-        latest_resume = candidate.get("latestResume") or {}
-        parsed_json = latest_resume.get("parsedJson")
+        # Resume source: support both candidate["resume"] (new schema) and candidate["latestResume"] (legacy)
+        resume_block = candidate.get("resume") or candidate.get("latestResume") or {}
+        parsed_json = resume_block.get("parsedJson")
         warnings: list[str] = []
         resume_source = "parsedJson" if parsed_json else "s3"
         parsed_resume: Any = parsed_json
 
         if not parsed_json:
             logger.info(
-                "Mongo resume cache miss: candidateId=%s applicationId=%s",
+                "Mongo resume cache miss: candidateId=%s applicationId=%s — fetching from S3",
                 candidate_id,
                 application_id,
             )
             logger.info(
                 "S3 fetch resume: candidateId=%s storageKey=%s fileName=%s",
                 candidate_id,
-                latest_resume.get("storageKey"),
-                latest_resume.get("fileName"),
+                resume_block.get("storageKey"),
+                resume_block.get("fileName"),
             )
             try:
-                stored_resume = self.storage.download_resume(latest_resume)
+                stored_resume = self.storage.download_resume(resume_block)
             except (ResumeDeletedError, FileNotFoundError) as exc:
                 raise DeletedApplicationError(
                     str(exc),
                     deleted_entity="resume",
                     details={
                         "resumeSource": "s3",
-                        "resumeStorageKey": latest_resume.get("storageKey"),
-                        "resumeFileName": latest_resume.get("fileName"),
+                        "resumeStorageKey": resume_block.get("storageKey"),
+                        "resumeFileName": resume_block.get("fileName"),
                     },
                 ) from exc
             logger.info(
@@ -438,8 +435,6 @@ class ATSWorker:
                 logger.info("Mongo write parsed resume cache: candidateId=%s", candidate_id)
                 self.repo.cache_candidate_parsed_resume(candidate_id, extracted_resume.model_dump())
                 logger.info("Mongo write parsed resume cache complete: candidateId=%s", candidate_id)
-            else:
-                logger.info("Mongo parsed resume cache disabled: candidateId=%s", candidate_id)
         else:
             logger.info(
                 "Mongo resume cache hit: candidateId=%s applicationId=%s",
@@ -450,86 +445,66 @@ class ATSWorker:
         job_data = _job_from_hrms_with_extraction(job, self.extraction_service)
         resume_data = _resume_from_hrms_candidate(candidate, parsed_resume)
         candidate_score = score_candidate(job_data, resume_data)
-        details = _score_details(job_data, resume_data, candidate_score, warnings=warnings)
-        details["resumeSource"] = resume_source
-        details["applicationStatus"] = application.get("status")
-        if latest_resume.get("storageKey"):
-            details["resumeStorageKey"] = latest_resume.get("storageKey")
-        if latest_resume.get("fileName"):
-            details["resumeFileName"] = latest_resume.get("fileName")
 
-        log_doc = _build_ats_log(
-            organization_id=self.settings.organization_id,
-            application=application,
+        details = _score_details(
+            job_data,
+            resume_data,
+            candidate_score,
+            shortlist_threshold=self.settings.shortlist_threshold,
+            warnings=warnings,
+            resume_source=resume_source,
+            resume_storage_key=resume_block.get("storageKey"),
+            resume_file_name=resume_block.get("fileName"),
+        )
+
+        logger.info(
+            "Mongo write ATS result: applicationId=%s score=%d decision=%s",
+            application_id,
+            candidate_score.total_score,
+            details.get("decision"),
+        )
+        self.repo.write_ats_result(
+            doc_id=application["_id"],
             score=candidate_score.total_score,
             details=details,
-            stage=self.settings.score_stage,
-            created_by=self.settings.created_by,
-            created_by_name=self.settings.created_by_name,
         )
-        self._write_score_log(log_doc)
+        logger.info("Mongo write ATS result complete: applicationId=%s", application_id)
 
-        return log_doc
+        return {"applicationId": application_id, "score": candidate_score.total_score, "details": details}
 
     def _insert_deleted_log(self, application: dict[str, Any], exc: DeletedApplicationError) -> None:
-        details = {
-            "status": "DELETED",
+        """Mark the application as processed with a DELETED decision so the worker skips it next poll."""
+        extra = {k: v for k, v in exc.details.items() if v not in (None, "")}
+        details: dict[str, Any] = {
+            "decision": "DELETED",
+            "recommendation": "DELETED",
             "deletedEntity": exc.deleted_entity,
-            "reason": str(exc),
             "warnings": [str(exc)],
-            "applicationStatus": application.get("status"),
+            "duplicateReason": None,
+            **extra,
         }
-        details.update(
-            {
-                key: value
-                for key, value in exc.details.items()
-                if value not in (None, "")
-            }
-        )
-        log_doc = _build_ats_log(
-            organization_id=self.settings.organization_id,
-            application=application,
-            score=0,
-            details=details,
-            stage=self.settings.score_stage,
-            created_at_iso=datetime.now(timezone.utc).isoformat(),
-            created_by=self.settings.created_by,
-            created_by_name=self.settings.created_by_name,
-        )
-        self._write_score_log(log_doc)
+        if application.get("_id"):
+            self.repo.write_ats_result(
+                doc_id=application["_id"],
+                score=0,
+                details=details,
+            )
 
     def _insert_failure_log(self, application: dict[str, Any], exc: Exception) -> None:
-        log_doc = _build_ats_log(
-            organization_id=self.settings.organization_id,
-            application=application,
-            score=0,
-            details={
-                "status": "FAILED",
-                "error": str(exc),
-                "warnings": [str(exc)],
-            },
-            stage=self.settings.score_stage,
-            created_at_iso=datetime.now(timezone.utc).isoformat(),
-            created_by=self.settings.created_by,
-            created_by_name=self.settings.created_by_name,
-        )
-        self._write_score_log(log_doc)
-
-    def _write_score_log(self, log_doc: dict[str, Any]) -> Any:
-        details = log_doc.get("details") or {}
-        logger.info(
-            "Mongo write ATS score log: applicationId=%s stage=%s score=%s status=%s",
-            log_doc.get("applicationId"),
-            log_doc.get("stage"),
-            log_doc.get("score"),
-            details.get("status", "SCORED"),
-        )
-        result = self.repo.insert_score_log(log_doc)
-        logger.info(
-            "Mongo write ATS score log complete: applicationId=%s",
-            log_doc.get("applicationId"),
-        )
-        return result
+        """Mark the application as processed with a FAILED decision to prevent infinite retry."""
+        details: dict[str, Any] = {
+            "decision": "FAILED",
+            "recommendation": "FAILED",
+            "error": str(exc),
+            "warnings": [str(exc)],
+            "duplicateReason": None,
+        }
+        if application.get("_id"):
+            self.repo.write_ats_result(
+                doc_id=application["_id"],
+                score=0,
+                details=details,
+            )
 
 
 def create_worker(settings: ATSSettings | None = None) -> ATSWorker:
