@@ -126,11 +126,17 @@ class ExperienceEntry(BaseModel):
 
     @model_validator(mode="after")
     def compute_duration(self) -> "ExperienceEntry":
+        start_value = month_index(self.start_date)
+        end_value = month_index(self.end_date)
+
+        # Sanitize inverted ranges from noisy extraction (e.g., 2025 -> 2000-01).
+        if start_value is not None and end_value is not None and end_value < start_value:
+            self.end_date = "Present"
+            end_value = month_index(self.end_date)
+
         if self.duration_months:
             return self
 
-        start_value = month_index(self.start_date)
-        end_value = month_index(self.end_date)
         if start_value is None or end_value is None or end_value < start_value:
             return self
 

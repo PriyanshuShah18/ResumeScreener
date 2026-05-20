@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 import contextvars
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from typing import List, Annotated
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
@@ -72,18 +72,29 @@ async def lifespan(app: FastAPI):
     log_info(f"Backend started. Available extractors: {', '.join(models) if models else 'Heuristics only'}")
 
     # ── Pre-warm skill graph for common skills (3.2) ──
-    try:
-        await asyncio.to_thread(
-            llm_service.generate_skill_graph,
-            ["python", "javascript", "sql", "react", "aws", "docker"]
-        )
-        log_info("Skill graph pre-warmed.")
-    except Exception as e:
-        logger.warning(f"Failed to pre-warm skill graph: {e}")
+    async def _prewarm_skill_graph() -> None:
+        try:
+            await asyncio.to_thread(
+                llm_service.generate_skill_graph,
+                ["python", "javascript", "sql", "react", "aws", "docker"],
+            )
+            log_info("Skill graph pre-warmed.")
+        except asyncio.CancelledError:
+            logger.info("Skill graph pre-warm cancelled during reload/shutdown.")
+        except Exception as exc:
+            logger.warning("Failed to pre-warm skill graph: %s", exc)
+
+    # Non-blocking prewarm prevents noisy startup cancellation traces on reload.
+    prewarm_task = asyncio.create_task(_prewarm_skill_graph())
 
     yield  # ── Application runs here ──
 
     # ── Shutdown — release GPU / model resources ──
+    if prewarm_task and not prewarm_task.done():
+        prewarm_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await prewarm_task
+
     logger.info("Shutting down HR Screening API...")
     try:
         from app.semantic_matching import get_semantic_matcher
@@ -114,7 +125,7 @@ app.add_middleware(
 @app.get("/")
 def root() -> dict[str, object]:
     return {
-        "message": "HR Resume Screening API (Production)",
+        "message": "HR Resume Screening API",
         "docs": "/docs",
         "health": "/health",
         "screen_resumes": "/screen-resumes",
@@ -182,7 +193,10 @@ async def screen_resumes(
 
     warnings: list[str] = []
     if not extraction_service.model_available:
-        warnings.append("No AI model available (Ollama/Groq/Gemini). Using heuristic extraction only.")
+        if extraction_service.load_error:
+            warnings.append(f"Model unavailable, using heuristic extraction: {extraction_service.load_error}")
+        else:
+            warnings.append("No AI model available (Ollama/Groq/Gemini). Using heuristic extraction only.")
 
     # ── Step 1: Extract Job Description ──
     try:
@@ -190,6 +204,10 @@ async def screen_resumes(
         jd_start = time.perf_counter()
         job_summary = await asyncio.to_thread(extraction_service.extract_job_description, job_description)
         log_info("📋 JD extraction took %.1fs", time.perf_counter() - jd_start)
+        if extraction_service.load_error:
+            lazy_warning = f"Model unavailable, using heuristic extraction: {extraction_service.load_error}"
+            if lazy_warning not in warnings:
+                warnings.append(lazy_warning)
     except Exception as exc:
         logger.exception("Job description extraction failed")
         raise HTTPException(status_code=500, detail=f"Failed to parse job description: {exc}") from exc

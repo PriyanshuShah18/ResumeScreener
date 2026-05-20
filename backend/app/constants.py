@@ -79,6 +79,25 @@ EXTRACTION_DOMAIN_NOISE: set[str] = EXTRACTION_SKILL_NOISE | {
 }
 
 # ---------------------------------------------------------------------------
+# JD sanitation guardrails — phrases that should never be treated as skills
+# ---------------------------------------------------------------------------
+JD_NON_SKILL_PHRASES: set[str] = {
+    "no experience needed",
+    "no experience required",
+    "no prior experience",
+    "fresher",
+    "freshers",
+    "entry level",
+}
+
+# ---------------------------------------------------------------------------
+# Role/skill normalization aliases for JD extraction + scoring defense
+# ---------------------------------------------------------------------------
+JD_ROLE_ALIASES: dict[str, str] = {
+    "fullstack": "full stack",
+}
+
+# ---------------------------------------------------------------------------
 # Seniority mapping — used for career-progression scoring
 # ---------------------------------------------------------------------------
 SENIORITY_MAP: dict[str, int] = {
@@ -182,11 +201,43 @@ SOFT_SKILL_MARKERS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 SECTION_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ("[SUMMARY]", ("professional summary", "profile summary", "summary", "objective", "about me")),
-    ("[SKILLS]", ("skills", "technical skills", "core competencies", "tech stack", "key skills")),
-    ("[EXPERIENCE]", ("experience", "work experience", "employment history", "professional experience")),
-    ("[EDUCATION]", ("education", "academic background", "qualifications")),
-    ("[CERTIFICATIONS]", ("certifications", "licenses", "credentials")),
-    ("[PROJECTS]", ("projects", "project experience", "key projects")),
+    (
+        "[SKILLS]",
+        (
+            "skills",
+            "technical skills",
+            "technical expertise",
+            "core competencies",
+            "tech stack",
+            "key skills",
+            "technologies",
+            "technology stack",
+        ),
+    ),
+    (
+        "[TOOLS]",
+        (
+            "tools",
+            "tools platforms",
+            "tools and platforms",
+            "platforms",
+            "tooling",
+            "development tools",
+        ),
+    ),
+    (
+        "[EXPERIENCE]",
+        (
+            "experience",
+            "work experience",
+            "employment history",
+            "professional experience",
+            "professional journey",
+        ),
+    ),
+    ("[EDUCATION]", ("education", "academic background", "academic qualifications", "qualifications")),
+    ("[CERTIFICATIONS]", ("certifications", "licenses", "credentials", "courses certifications")),
+    ("[PROJECTS]", ("projects", "project experience", "key projects", "selected projects", "personal projects")),
     ("[LINKS]", ("links", "profiles", "portfolio", "online presence")),
 ]
 

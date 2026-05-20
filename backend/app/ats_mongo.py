@@ -7,8 +7,10 @@ from app.ats_settings import ATSSettings
 
 class ATSMongoRepository:
     """
-    Unified repository: all ATS reads and writes go to hrmsjobapplications.
-    The separate hrmsatslogs collection is retired.
+    Repository for ATS worker reads and writes.
+    Supports both:
+      - modern inline application writes (`write_ats_result`)
+      - legacy score log collection writes (`insert_score_log`)
     """
 
     def __init__(self, db: Any):
@@ -16,6 +18,10 @@ class ATSMongoRepository:
         self.applications = db["hrmsjobapplications"]
         self.candidates = db["hrmscandidates"]
         self.jobs = db["hrmsjobs"]
+        try:
+            self.score_logs = db["hrmsatslogs"]
+        except Exception:
+            self.score_logs = None
 
     @classmethod
     def from_settings(cls, settings: ATSSettings) -> "ATSMongoRepository":
@@ -48,13 +54,32 @@ class ATSMongoRepository:
     def fetch_pending_applications(self, limit: int, status: str = "APPLIED") -> list[dict[str, Any]]:
         """
         Return unprocessed applications in APPLIED status.
-        Filter: atsProcessed == False AND status == "APPLIED"
+        Rules:
+          - status must match
+          - skip apps already atsProcessed=True
+          - skip apps with an existing SCORE log unless that log is FAILED
         """
-        cursor = self.applications.find(
-            {"atsProcessed": False, "status": status},
-            limit=limit,
-        )
-        return list(cursor)
+        applications = list(self.applications.find({"status": status}))
+        pending: list[dict[str, Any]] = []
+        for application in applications:
+            if application.get("atsProcessed") is True:
+                continue
+            if self._has_completed_score_log(application.get("applicationId")):
+                continue
+            pending.append(application)
+            if len(pending) >= limit:
+                break
+        return pending
+
+    def _has_completed_score_log(self, application_id: Any) -> bool:
+        if self.score_logs is None or not application_id:
+            return False
+        existing = self.score_logs.find_one({"applicationId": application_id, "stage": "SCORE"})
+        if not existing:
+            return False
+        details = existing.get("details") if isinstance(existing, dict) else {}
+        status = str((details or {}).get("status", "")).upper()
+        return status != "FAILED"
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         return self.candidates.find_one({"candidateId": candidate_id})
@@ -105,11 +130,24 @@ class ATSMongoRepository:
             },
         )
 
+    def insert_score_log(self, log: dict[str, Any]) -> Any:
+        """Legacy helper: write ATS score logs to hrmsatslogs."""
+        if self.score_logs is None:
+            return None
+        result = self.score_logs.insert_one(log)
+        return getattr(result, "inserted_id", None)
+
     def cache_candidate_parsed_resume(self, candidate_id: str, parsed_json: dict[str, Any]) -> None:
         """Cache the expensive LLM-parsed resume JSON on the candidate document."""
         self.candidates.update_one(
             {"candidateId": candidate_id},
             {"$set": {"latestResume.parsedJson": parsed_json}},
+        )
+
+    def update_application_status(self, application_id: str, status: str) -> None:
+        self.applications.update_one(
+            {"applicationId": application_id},
+            {"$set": {"status": status}},
         )
 
     def clear_candidate_parsed_resume_cache(self) -> int:

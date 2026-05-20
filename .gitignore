@@ -111,35 +111,37 @@ transformers_cache/
 generated/
 outputs/
 tmp/
+*.tmp
 
 # -------------------------
 # Project-specific exclusions
 # -------------------------
 backend/tests/
 tests/
-!backend/tests/
-backend/tests/*
-!backend/tests/test_ats_*.py
+
+# Local dev/scratch files
 backend/HR.md
 backend/*WALKTHROUGH*.md
+backend/function_async_classification.md
+backend/test_generation.py
+backend/test_image_upload.py
+test_generation.py
+HR.md
+HR_WALKTHROUGH.md
 
 # -------------------------
 # Project-specific local artifacts
 # -------------------------
 .codex-backups/
-
 PROJECT_CHANGE_LOG.md
-
+START_COMMANDS.md
 .env.example
 !backend/.env.example
-HR.md
-HR_WALKTHROUGH.md
-test_generation.py
 
-# Local LLM Caches
+# Local LLM caches
 skill_graph_cache.json
 backend/skill_graph_cache.json
-backend/test_image_upload.py
+backend/skill_graph_cache.tmp
 
-backend/tests/
+# Docs (local only)
 docs/

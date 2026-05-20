@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 from app.config import get_settings
-from app.schemas import JobDescriptionData, ResumeData
+from app.schemas import JobDescriptionData, ResumeData, normalize_skill
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ except ImportError:
     genai = None
 
 SKILL_GRAPH_CACHE_FILE = Path(__file__).resolve().parent.parent / "skill_graph_cache.json"
+SKILL_GRAPH_RELATIONS = ("equivalent", "parent", "adjacent")
 
 
 def _get_bool_env(name: str, default: bool) -> bool:
@@ -31,6 +32,70 @@ def _get_bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate limit" in text or "too many requests" in text
+
+
+def _dedupe_terms(values: list[Any], limit: int = 12) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = normalize_skill(str(value))
+        if not normalized or normalized in seen or len(normalized) > 80:
+            continue
+        seen.add(normalized)
+        terms.append(normalized)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def normalize_skill_graph_entry(skill: str, value: Any) -> dict[str, Any]:
+    relations: dict[str, list[str]] = {name: [] for name in SKILL_GRAPH_RELATIONS}
+    if isinstance(value, dict):
+        for relation in SKILL_GRAPH_RELATIONS:
+            raw_values = value.get(relation) or value.get(f"{relation}s") or []
+            if not isinstance(raw_values, list):
+                raw_values = [raw_values]
+            relations[relation] = _dedupe_terms(raw_values, limit=8)
+    elif isinstance(value, list):
+        relations["parent"] = _dedupe_terms(value, limit=8)
+
+    base_skill = normalize_skill(skill)
+    terms = _dedupe_terms(
+        [base_skill]
+        + relations["equivalent"]
+        + relations["parent"]
+        + relations["adjacent"],
+        limit=16,
+    )
+    return {
+        "terms": terms or [base_skill],
+        "relations": relations,
+    }
+
+
+def skill_graph_terms(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        raw_terms = value.get("terms")
+        if isinstance(raw_terms, list):
+            return _dedupe_terms(raw_terms, limit=16)
+        relations = value.get("relations")
+        if isinstance(relations, dict):
+            combined: list[Any] = []
+            for relation in SKILL_GRAPH_RELATIONS:
+                relation_values = relations.get(relation, [])
+                if isinstance(relation_values, list):
+                    combined.extend(relation_values)
+            return _dedupe_terms(combined, limit=16)
+    if isinstance(value, list):
+        return _dedupe_terms(value, limit=16)
+    if isinstance(value, str):
+        return _dedupe_terms([value], limit=1)
+    return []
 
 
 class _RateLimiter:
@@ -102,14 +167,17 @@ class LLMUnderstandingService:
             logger.info("✅ Local Ollama Fallback active at %s", self.ollama_base)
 
     def _generate_json_with_retry(self, provider_func, provider_name: str, retries: int = 2) -> Any:
-        """Helper to retry a provider if it hits a rate limit."""
+        """Retry transient failures, but switch models immediately on rate limits."""
         for attempt in range(retries + 1):
             try:
                 return provider_func()
             except Exception as exc:
-                if "429" in str(exc) and attempt < retries:
+                if _is_rate_limit_error(exc):
+                    logger.warning("%s rate limited; trying the next configured model.", provider_name)
+                    raise exc
+                if attempt < retries:
                     wait_time = (attempt + 1) * 5
-                    logger.warning("⚠️ %s rate limited. Retrying in %ds... (Attempt %d/%d)", 
+                    logger.warning("⚠️ %s failed. Retrying in %ds... (Attempt %d/%d)", 
                                    provider_name, wait_time, attempt + 1, retries)
                     time.sleep(wait_time)
                     continue
@@ -125,6 +193,43 @@ class LLMUnderstandingService:
         )
         res, _ = self._generate_json(prompt, None)
         return res
+
+    def _ollama_available_models(self) -> list[str]:
+        try:
+            with httpx.Client() as client:
+                resp = client.get(f"{self.ollama_base}/api/tags", timeout=3.0)
+                if resp.status_code != 200:
+                    return []
+                models = resp.json().get("models", [])
+                return [
+                    str(item.get("name") or item.get("model") or "").strip()
+                    for item in models
+                    if str(item.get("name") or item.get("model") or "").strip()
+                ]
+        except Exception:
+            return []
+
+    def _ollama_model_candidates(self) -> list[str]:
+        preferred = [
+            self.settings.model_id,
+            "qwen2.5:32b",
+            "qwen2.5:14b",
+            "qwen2.5:7b",
+            "llama3.2:latest",
+            "llama3.1:8b",
+            "phi3:14b",
+            "qwen2.5:3b",
+        ]
+        installed = self._ollama_available_models()
+        installed_set = set(installed)
+
+        ordered: list[str] = []
+        for model in preferred:
+            if model and (not installed_set or model in installed_set):
+                ordered.append(model)
+        for model in installed:
+            ordered.append(model)
+        return list(dict.fromkeys(ordered))
 
     def _generate_json(self, prompt: str, default: Any) -> tuple[Any, str]:
         if not self.enabled:
@@ -190,18 +295,7 @@ class LLMUnderstandingService:
 
         # ── Layer 4: Local Ollama (Unbeatable Reliability) ──
         logger.info("🔄 Falling back to Layer 4: Local Ollama")
-        # Order: User preference, then Largest/Best models
-        models = [
-            self.settings.model_id, # Respect user-configured model (default qwen2.5vl:3b)
-            "qwen2.5:32b",
-            "qwen2.5:14b",
-            "llama3.1:8b",
-            "qwen2.5:7b",
-            "phi3:14b",
-            "qwen2.5:3b"
-        ]
-        # Remove duplicates while preserving order
-        models = list(dict.fromkeys(models))
+        models = self._ollama_model_candidates()
         
         for model in models:
             try:
@@ -227,20 +321,27 @@ class LLMUnderstandingService:
         if not self.enabled:
             return {s: [s] for s in skills}
         cache = self._load_cache()
-        uncached = [s for s in skills if s not in cache]
-        if not uncached: return {s: cache[s] for s in skills if s in cache}
+        normalized_skills = [normalize_skill(s) for s in skills if normalize_skill(s)]
+        uncached = [s for s in normalized_skills if s not in cache]
+        if not uncached:
+            return {s: skill_graph_terms(cache[s]) or [s] for s in normalized_skills if s in cache}
         prompt = (
-            "Group these skills into broader categories. Return STRICTLY a JSON object where each key is an EXACT string "
-            "from the provided 'Skills' list, and the value is a list of its parent categories.\n"
+            "Build a conservative skill relation graph. Return STRICTLY a JSON object where each key is an EXACT string "
+            "from the provided 'Skills' list. Each value must be an object with optional arrays: "
+            "'equivalent' for spelling/synonym equivalents, 'parent' for broader categories, and 'adjacent' for closely related tools. "
+            "Only include relationships you are confident are professionally relevant.\n"
             f"Skills: {json.dumps(uncached)}"
         )
         result, _ = self._generate_json(prompt, {})
         if isinstance(result, dict):
-            # Strict validation to ensure we don't pollute the cache with malformed LLM keys
-            valid_updates = {k: v for k, v in result.items() if k in uncached and isinstance(v, list)}
+            valid_updates = {
+                normalize_skill(k): normalize_skill_graph_entry(normalize_skill(k), v)
+                for k, v in result.items()
+                if normalize_skill(k) in uncached and isinstance(v, (dict, list))
+            }
             cache.update(valid_updates)
             self._save_cache(cache)
-        return {s: cache.get(s, [s]) for s in skills}
+        return {s: skill_graph_terms(cache.get(s)) or [s] for s in normalized_skills}
 
     def _load_cache(self) -> dict[str, Any]:
         if SKILL_GRAPH_CACHE_FILE.exists():
@@ -250,15 +351,29 @@ class LLMUnderstandingService:
 
     def _save_cache(self, cache: dict):
         with self._cache_lock:
-            try:
-                data = json.dumps(cache, indent=2)
-                tmp = SKILL_GRAPH_CACHE_FILE.with_suffix(".tmp")
-                tmp.write_text(data)
-                if os.path.exists(SKILL_GRAPH_CACHE_FILE):
-                    os.remove(SKILL_GRAPH_CACHE_FILE)
-                os.rename(str(tmp), str(SKILL_GRAPH_CACHE_FILE))
-            except Exception as e:
-                logger.warning("Failed to save skill graph cache (Windows lock?): %s", e)
+            data = json.dumps(cache, indent=2)
+            tmp = SKILL_GRAPH_CACHE_FILE.with_name(
+                f"{SKILL_GRAPH_CACHE_FILE.stem}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+
+            # Windows can briefly lock files under concurrent writes/readers.
+            # Use atomic replace and retry a few times before warning.
+            for attempt in range(5):
+                try:
+                    tmp.write_text(data, encoding="utf-8")
+                    os.replace(str(tmp), str(SKILL_GRAPH_CACHE_FILE))
+                    return
+                except Exception as exc:
+                    if attempt >= 4:
+                        logger.warning("Failed to save skill graph cache (Windows lock?): %s", exc)
+                    else:
+                        time.sleep(0.05 * (attempt + 1))
+                finally:
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except Exception:
+                        pass
 
 llm_service = LLMUnderstandingService()
 

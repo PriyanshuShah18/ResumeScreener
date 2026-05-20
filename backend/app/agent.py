@@ -14,6 +14,8 @@ from pydantic import ValidationError
 
 from app.config import Settings, get_settings
 from app.constants import (
+    JD_NON_SKILL_PHRASES,
+    JD_ROLE_ALIASES,
     EXTRACTION_DOMAIN_NOISE as DOMAIN_NOISE,
     EXTRACTION_SKILL_NOISE as SKILL_NOISE,
     KNOWN_EDUCATION,
@@ -47,6 +49,9 @@ class HRExtractionService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.load_error = ""
+        # Backward compatibility for existing tests and legacy call sites.
+        self.model = None
+        self.processor = None
         self._ollama_available = False
         # Check connectivity to Ollama on init
         try:
@@ -58,7 +63,7 @@ class HRExtractionService:
 
     @property
     def model_available(self) -> bool:
-        return self._ollama_available or llm_service.enabled
+        return bool(self.model is not None and self.processor is not None) or llm_service.enabled
 
     def preload(self) -> None:
         pass  # Ollama loads on first request
@@ -107,12 +112,31 @@ class HRExtractionService:
         if not has_text and not has_images:
             return schema_cls()
 
+        if has_images and not has_text and (self.model is None or self.processor is None):
+            raise RuntimeError("OCR text is unavailable and the vision model is not loaded")
+
         t0 = time.perf_counter()
 
         # ── FAST PATH: Text-rich documents → Heuristic + Groq/Gemini ──
         if has_text:
             # Step 1: Always run the fast heuristic (< 10ms)
             heuristic_data = heuristic(input_text)
+
+            # Step 2: Legacy local model path (kept for backward compatibility/tests)
+            if self.model is not None and self.processor is not None:
+                try:
+                    raw_response = self.generate_response([{"role": "user", "content": prompt}])
+                    if raw_response and raw_response.strip():
+                        parsed_json = self.parse_json(raw_response)
+                        validated = schema_cls(**parsed_json)
+                        if self.has_meaningful_extraction(validated):
+                            result = self.merge_with_heuristic(schema_cls, validated, input_text, heuristic)
+                            elapsed = time.perf_counter() - t0
+                            logger.info("✅ Fast-path extraction (Local-Model) in %.1fs", elapsed)
+                            self._log_extraction_result(result, "Fast-path:Local-Model")
+                            return result
+                except Exception as exc:
+                    logger.warning("Legacy local model extraction failed, continuing with fallback chain: %s", exc)
 
             # Step 2: Try Groq/Gemini LLM for higher quality (2-5s)
             if llm_service.enabled:
@@ -152,7 +176,7 @@ class HRExtractionService:
             return result
 
         # ── SLOW PATH: Image-only documents → Ollama VLM ──
-        if has_images and self._ollama_available:
+        if has_images and self.model is not None and self.processor is not None:
             messages = [{"role": "user", "content": prompt}]
             base64_image = self.image_to_base64(self.resize_image(page_images[0]))
             messages[0]["images"] = [base64_image]
@@ -169,7 +193,7 @@ class HRExtractionService:
                     })
 
                 try:
-                    raw_response = self.generate_ollama_response(messages)
+                    raw_response = self.generate_response(messages)
                 except Exception as exc:
                     logger.error("Ollama VLM request failed: %s", exc)
                     break
@@ -194,7 +218,7 @@ class HRExtractionService:
 
         # ── FINAL FALLBACK ──
         if not has_text and has_images:
-            raise RuntimeError("Vision-based extraction failed and no OCR text was available.")
+            raise RuntimeError("OCR text is unavailable and the vision model is not loaded")
 
         elapsed = time.perf_counter() - t0
         logger.info("⚠️ Fallback heuristic extraction in %.1fs", elapsed)
@@ -248,6 +272,10 @@ class HRExtractionService:
                 backoff *= 2
         
         raise last_exc or Exception("Ollama extraction failed after 3 attempts")
+
+    def generate_response(self, messages: list[dict[str, Any]]) -> str:
+        """Backward-compatible wrapper used by tests and legacy call paths."""
+        return self.generate_ollama_response(messages)
 
     # ─── Image Utilities ─────────────────────────────────────────────────
 
@@ -313,6 +341,7 @@ class HRExtractionService:
             "You are an expert technical recruiter. Read the job description and return ONLY valid JSON "
             f"matching this schema: {json.dumps(schema_json)}.\n\n"
             "CRITICAL INSTRUCTIONS:\n"
+            "0. Do not restrict extraction to predefined skill lists.\n"
             "1. If the job description is extremely brief (e.g. just a title like 'AI/ML Developer'), you should infer 3-5 "
             "relevant 'good-to-have' skills or 'domain_keywords' that are standard for this role to provide context. "
             "Only place skills in 'must_have_skills' if they are explicitly mentioned or are the absolute core of the title.\n"
@@ -332,8 +361,9 @@ class HRExtractionService:
             "\n\nSTRICT INSTRUCTIONS:\n"
             "1. Use section markers like [CONTACT_INFO], [SKILLS], [EXPERIENCE] etc. as structural hints.\n"
             "2. Extract ALL relevant skills, tools, and certifications.\n"
-            "3. Extract only the 3 MOST RECENT job experiences and 3 MOST RECENT projects.\n"
-            "4. For experience highlights: PRESERVE quantified impact numbers (%, ms, users, $, scale) "
+            "3. Do not limit extraction to predefined categories or static skill lists.\n"
+            "4. Extract only the 3 MOST RECENT job experiences and 3 MOST RECENT projects.\n"
+            "5. For experience highlights: PRESERVE quantified impact numbers (%, ms, users, $, scale) "
             "and ownership verbs (led, designed, built, shipped, owned). These are critical for scoring. "
             "Truncate generic filler but keep measurable outcomes. Max 120 chars per bullet.\n"
             "\nReturn ONLY a strictly valid JSON object."
@@ -361,15 +391,28 @@ class HRExtractionService:
         must_have = self.extract_skills("\n".join(sections.get("required", [])), limit=16)
         if not must_have:
             must_have = self.extract_skills(text, limit=12)
+        must_have = self.sanitize_jd_skill_terms(must_have, limit=16)
+        good_to_have = self.sanitize_jd_skill_terms(
+            self.extract_skills("\n".join(sections.get("preferred", [])), limit=14),
+            limit=14,
+        )
+        domain_keywords: list[str] = []
+
+        # Sparse title-only JDs (e.g. "AI/ML Developer") need minimal domain context
+        # so ranking doesn't become too brittle under heuristic extraction.
+        if len(lines) <= 2 and not any(sections.values()):
+            inferred = self.infer_short_jd_context(title)
+            good_to_have = self.sanitize_jd_skill_terms(good_to_have + inferred["good_to_have"], limit=14)
+            domain_keywords = self.sanitize_jd_skill_terms(inferred["domain_keywords"], limit=12)
 
         return {
             "title": title,
             "must_have_skills": must_have,
-            "good_to_have_skills": self.extract_skills("\n".join(sections.get("preferred", [])), limit=14),
+            "good_to_have_skills": good_to_have,
             "min_years_experience": years,
             "required_education": [token for token in KNOWN_EDUCATION if token in text.lower()],
             "required_certifications": [],
-            "domain_keywords": [],
+            "domain_keywords": domain_keywords,
             "responsibilities": sections.get("responsibilities", [])[:6],
         }
 
@@ -419,7 +462,7 @@ class HRExtractionService:
         # ── Location extraction ──
         location = ""
         loc_match = re.search(
-            r"(?i)(?:location|address|city|based in)[:\s]*(.+)",
+            r"(?im)^\s*(?:location|address|city|based in)\s*[:\-]\s*(.+)$",
             text[:2000],
         )
         if loc_match:
@@ -443,6 +486,11 @@ class HRExtractionService:
                     seen.add(s.lower())
                 if len(skills) >= 25:
                     break
+
+        tools_text = "\n".join(sections.get("TOOLS", []))
+        tools = self.extract_skills(tools_text, limit=20) if tools_text.strip() else []
+        if not tools:
+            tools = self.extract_tools_from_lines(all_lines, limit=20)
 
         # ── Summary ──
         summary_lines = sections.get("SUMMARY", []) or sections.get("OBJECTIVE", [])
@@ -474,7 +522,7 @@ class HRExtractionService:
 
         # ── Projects ──
         proj_lines = sections.get("PROJECTS", [])
-        projects = [line for line in proj_lines[:5] if line.strip()] if proj_lines else []
+        projects = self.extract_project_lines(proj_lines, limit=5) if proj_lines else []
 
         # ── Certifications ──
         cert_lines = sections.get("CERTIFICATIONS", [])
@@ -489,13 +537,23 @@ class HRExtractionService:
             "portfolio": portfolio,
             "summary": summary,
             "skills": skills,
-            "tools": [],
+            "tools": tools,
             "total_years_experience": years,
             "experience_entries": experience_entries,
             "education_entries": education_entries,
             "certifications": certifications,
             "projects": projects,
-            "metadata": {},
+            "metadata": {
+                "heuristic_confidence": self.heuristic_confidence(
+                    email=bool(email),
+                    phone=bool(phone),
+                    skills=skills,
+                    tools=tools,
+                    experience_entries=experience_entries,
+                    education_entries=education_entries,
+                    projects=projects,
+                )
+            },
         }
 
     # ─── Section & Skill Parsing Utilities ───────────────────────────────
@@ -536,6 +594,106 @@ class HRExtractionService:
 
     def extract_skills(self, text: str, limit: int = 16) -> list[str]:
         return self.extract_phrases(text, limit=limit, max_tokens=5)
+
+    def sanitize_jd_skill_terms(self, skills: list[str], limit: int = 16) -> list[str]:
+        sanitized: list[str] = []
+        seen: set[str] = set()
+
+        for skill in skills:
+            cleaned = normalize_skill(skill)
+            if not cleaned:
+                continue
+
+            for alias, replacement in JD_ROLE_ALIASES.items():
+                cleaned = re.sub(rf"\b{re.escape(alias)}\b", replacement, cleaned)
+            cleaned = normalize_whitespace(cleaned)
+
+            if cleaned in JD_NON_SKILL_PHRASES:
+                continue
+            if cleaned in SKILL_NOISE:
+                continue
+            if cleaned in seen:
+                continue
+
+            seen.add(cleaned)
+            sanitized.append(cleaned)
+            if len(sanitized) >= limit:
+                break
+
+        return sanitized
+
+    def infer_short_jd_context(self, title: str) -> dict[str, list[str]]:
+        normalized_title = normalize_skill(title)
+        if re.search(r"\b(ai|ml|machine learning|artificial intelligence)\b", normalized_title):
+            return {
+                "good_to_have": ["python", "deep learning", "natural language processing"],
+                "domain_keywords": ["artificial intelligence", "machine learning"],
+            }
+        if re.search(r"\b(full stack|fullstack)\b", normalized_title):
+            return {
+                "good_to_have": ["javascript", "react", "node.js"],
+                "domain_keywords": ["web development", "backend api", "frontend"],
+            }
+        return {"good_to_have": [], "domain_keywords": []}
+
+    def extract_tools_from_lines(self, lines: list[str], limit: int = 16) -> list[str]:
+        chunks: list[str] = []
+        for idx, line in enumerate(lines):
+            lowered = line.lower()
+            if any(marker in lowered for marker in TOOL_CONTEXT_MARKERS):
+                if ":" in line:
+                    chunks.append(line.split(":", 1)[1])
+                if idx + 1 < len(lines):
+                    chunks.append(lines[idx + 1])
+        return self.extract_skills("\n".join(chunks), limit=limit)
+
+    def extract_project_lines(self, lines: list[str], limit: int = 5) -> list[str]:
+        projects: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            cleaned = normalize_whitespace(self.strip_bullet_prefix(line))
+            if not cleaned:
+                continue
+            normalized = cleaned.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            projects.append(cleaned)
+            if len(projects) >= limit:
+                break
+        return projects
+
+    def heuristic_confidence(
+        self,
+        *,
+        email: bool,
+        phone: bool,
+        skills: list[str],
+        tools: list[str],
+        experience_entries: list[Any],
+        education_entries: list[Any],
+        projects: list[str],
+    ) -> dict[str, int]:
+        contact = 100 if email and phone else 60 if email or phone else 0
+        skill_confidence = min((len(skills) + len(tools)) * 12, 100)
+        experience_confidence = min(len(experience_entries) * 35, 100)
+        education_confidence = min(len(education_entries) * 50, 100)
+        project_confidence = min(len(projects) * 25, 100)
+        overall = round(
+            0.20 * contact
+            + 0.30 * skill_confidence
+            + 0.25 * experience_confidence
+            + 0.15 * education_confidence
+            + 0.10 * project_confidence
+        )
+        return {
+            "overall": overall,
+            "contact": round(contact),
+            "skills": round(skill_confidence),
+            "experience": round(experience_confidence),
+            "education": round(education_confidence),
+            "projects": round(project_confidence),
+        }
 
     def extract_phrases(self, text: str, limit: int = 16, max_tokens: int = 6) -> list[str]:
         items: list[str] = []

@@ -361,6 +361,45 @@ class ATSWorker:
 
         return summary
 
+    def _persist_score(self, application: dict[str, Any], score: int, details: dict[str, Any]) -> None:
+        application_id = application.get("applicationId")
+        stage = self.settings.score_stage
+
+        if hasattr(self.repo, "insert_score_log"):
+            log_doc = {
+                "applicationId": application_id,
+                "candidateId": application.get("candidateId"),
+                "jobId": application.get("jobId"),
+                "stage": stage,
+                "score": score,
+                "details": details,
+                "createdBy": self.settings.created_by,
+                "createdByName": self.settings.created_by_name,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+            logger.info(
+                "Mongo write ATS score log: applicationId=%s stage=%s score=%d",
+                application_id,
+                stage,
+                score,
+            )
+            self.repo.insert_score_log(log_doc)
+            logger.info("Mongo write ATS score log complete: applicationId=%s", application_id)
+
+        if hasattr(self.repo, "write_ats_result") and application.get("_id"):
+            logger.info(
+                "Mongo write ATS result: applicationId=%s score=%d decision=%s",
+                application_id,
+                score,
+                details.get("decision"),
+            )
+            self.repo.write_ats_result(
+                doc_id=application["_id"],
+                score=score,
+                details=details,
+            )
+            logger.info("Mongo write ATS result complete: applicationId=%s", application_id)
+
     def process_application(self, application: dict[str, Any]) -> dict[str, Any]:
         application_id = application.get("applicationId")
         candidate_id = application.get("candidateId")
@@ -457,18 +496,7 @@ class ATSWorker:
             resume_file_name=resume_block.get("fileName"),
         )
 
-        logger.info(
-            "Mongo write ATS result: applicationId=%s score=%d decision=%s",
-            application_id,
-            candidate_score.total_score,
-            details.get("decision"),
-        )
-        self.repo.write_ats_result(
-            doc_id=application["_id"],
-            score=candidate_score.total_score,
-            details=details,
-        )
-        logger.info("Mongo write ATS result complete: applicationId=%s", application_id)
+        self._persist_score(application, candidate_score.total_score, details)
 
         return {"applicationId": application_id, "score": candidate_score.total_score, "details": details}
 
@@ -476,35 +504,28 @@ class ATSWorker:
         """Mark the application as processed with a DELETED decision so the worker skips it next poll."""
         extra = {k: v for k, v in exc.details.items() if v not in (None, "")}
         details: dict[str, Any] = {
+            "status": "DELETED",
             "decision": "DELETED",
             "recommendation": "DELETED",
             "deletedEntity": exc.deleted_entity,
+            "reason": str(exc),
             "warnings": [str(exc)],
             "duplicateReason": None,
             **extra,
         }
-        if application.get("_id"):
-            self.repo.write_ats_result(
-                doc_id=application["_id"],
-                score=0,
-                details=details,
-            )
+        self._persist_score(application, 0, details)
 
     def _insert_failure_log(self, application: dict[str, Any], exc: Exception) -> None:
         """Mark the application as processed with a FAILED decision to prevent infinite retry."""
         details: dict[str, Any] = {
+            "status": "FAILED",
             "decision": "FAILED",
             "recommendation": "FAILED",
             "error": str(exc),
             "warnings": [str(exc)],
             "duplicateReason": None,
         }
-        if application.get("_id"):
-            self.repo.write_ats_result(
-                doc_id=application["_id"],
-                score=0,
-                details=details,
-            )
+        self._persist_score(application, 0, details)
 
 
 def create_worker(settings: ATSSettings | None = None) -> ATSWorker:

@@ -55,7 +55,13 @@ def lexical_similarity(left: str, right: str) -> float:
     right_tokens = _tokenize(right_norm)
     if left_tokens and right_tokens:
         jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-        subset_bonus = 0.85 if left_tokens.issubset(right_tokens) or right_tokens.issubset(left_tokens) else 0.0
+        has_subset = left_tokens.issubset(right_tokens) or right_tokens.issubset(left_tokens)
+        if has_subset and min(len(left_tokens), len(right_tokens)) >= 2:
+            subset_bonus = 0.9
+        elif has_subset:
+            subset_bonus = 0.85
+        else:
+            subset_bonus = 0.0
     else:
         jaccard = 0.0
         subset_bonus = 0.0
@@ -243,8 +249,6 @@ class SemanticMatcher:
                 members: list[str] = cluster["members"]
                 if skill not in members:
                     members.append(skill)
-                if len(skill) < len(cluster["canonical"]):
-                    cluster["canonical"] = skill
                 continue
 
             clusters.append({"canonical": skill, "members": [skill]})
@@ -309,12 +313,14 @@ class SemanticMatcher:
             return lexical_score
 
         # Primary Intelligence: Check Gemini LLM dynamic skill graph
-        from app.llm_understanding import llm_service
+        from app.llm_understanding import llm_service, skill_graph_terms
         try:
             llm_cache = llm_service._load_cache()
-            if left_norm in llm_cache and right_norm in [s.lower() for s in llm_cache[left_norm]]:
+            left_terms = [s.lower() for s in skill_graph_terms(llm_cache.get(left_norm))]
+            right_terms = [s.lower() for s in skill_graph_terms(llm_cache.get(right_norm))]
+            if left_norm in llm_cache and right_norm in left_terms:
                 return 0.85
-            if right_norm in llm_cache and left_norm in [s.lower() for s in llm_cache[right_norm]]:
+            if right_norm in llm_cache and left_norm in right_terms:
                 return 0.85
         except Exception:
             pass
