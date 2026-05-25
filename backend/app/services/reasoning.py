@@ -327,7 +327,9 @@ def generate_reasoning(
     """
     prompt = build_reasoning_prompt(job, resume, score)
 
-    if model_client is not None and getattr(model_client, "model_available", False):
+    if llm_service.enabled:
+        result, _ = llm_service._generate_json(prompt, {})
+    elif model_client is not None and getattr(model_client, "model_available", False):
         if hasattr(model_client, "generate_response") and hasattr(model_client, "parse_json"):
             try:
                 raw_response = model_client.generate_response([{"role": "user", "content": prompt}])
@@ -336,8 +338,6 @@ def generate_reasoning(
                 result = None
         else:
             result = None
-    elif llm_service.enabled:
-        result, _ = llm_service._generate_json(prompt, {})
     else:
         return fallback_reasoning(job, resume, score)
 

@@ -238,7 +238,7 @@ class LLMUnderstandingService:
 
         # ── Layer 1: Groq (Tiered: 70B then Qwen then 8B) ──
         if self.groq_client and self._groq_limiter.acquire():
-            for model in ["llama-3.3-70b-versatile", "qwen-2.5-32b", "llama-3.1-8b-instant"]:
+            for model in ["llama-3.3-70b-versatile", "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant"]:
                 try:
                     def _groq_call(m=model, p=prompt):
                         return self.groq_client.chat.completions.create(
