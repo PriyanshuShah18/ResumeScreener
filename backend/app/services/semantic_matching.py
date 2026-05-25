@@ -98,7 +98,7 @@ class SemanticMatcher:
         self._cache_max = 2048
         self.enable_model = enable_model and _HAS_TRANSFORMERS
         self._hf_api_key: str | None = None
-        self._hf_model_url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+        self._hf_model_url = "https://router.huggingface.co/hf-inference/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
         # Circuit breaker: flipped to False on first HF failure.
         # Protected by a lock so parallel resume threads don't all race past the check simultaneously.
         self._hf_healthy: bool = True
@@ -135,17 +135,21 @@ class SemanticMatcher:
             if not self._hf_healthy:
                 return None
             try:
-                response = httpx.post(
-                    self._hf_model_url,
-                    headers={"Authorization": f"Bearer {self._hf_api_key}"},
-                    json={"inputs": texts, "options": {"wait_for_model": True}},
-                    timeout=20.0,
-                )
-                if response.status_code != 200:
-                    print(f"HuggingFace API error {response.status_code}: {response.text[:200]}")
-                    self._hf_healthy = False
-                    return None
-                data = response.json()
+                from huggingface_hub import InferenceClient
+                client = InferenceClient(token=self._hf_api_key)
+                
+                # InferenceClient requires the fully qualified repository ID.
+                # Local sentence-transformers implicitly adds 'sentence-transformers/', but the Hub API needs it explicitly.
+                repo_id = self.model_name if "/" in self.model_name else f"sentence-transformers/{self.model_name}"
+                
+                # InferenceClient automatically handles the correct router URLs and task payloads.
+                # We use feature_extraction to force it to return raw embeddings.
+                data = client.feature_extraction(texts, model=repo_id)
+                
+                # Output is typically a list of lists (or a numpy array). We ensure it's a list.
+                if hasattr(data, "tolist"):
+                    data = data.tolist()
+                    
                 if isinstance(data, list) and len(data) == len(texts):
                     return data
                 return None
