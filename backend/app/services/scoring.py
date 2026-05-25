@@ -553,9 +553,12 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         for detail in preferred_match["details"]
         if detail["matched_skill"] and detail["similarity"] >= matcher.required_match_threshold
     )
+    # To keep the UI concise, we only pull "Additional Relevant Skills" from explicitly 
+    # listed skills/tools, avoiding long certification or project names bleeding into this section.
+    explicit_candidate_skills = sorted(normalize_set(resume.skills + resume.tools))
     additional_relevant_skills, additional_relevant_details = matcher.find_additional_relevant_skills(
         jd_context_terms,
-        candidate_skills,
+        explicit_candidate_skills,
         exclude=excluded_candidates,
         threshold=matcher.additional_relevance_threshold,
     )
