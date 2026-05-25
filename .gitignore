@@ -120,21 +120,12 @@ backend/tests/
 tests/
 
 # Local dev/scratch files
-backend/HR.md
-backend/*WALKTHROUGH*.md
-backend/function_async_classification.md
-backend/test_generation.py
-backend/test_image_upload.py
-test_generation.py
-HR.md
-HR_WALKTHROUGH.md
+# (Removed obsolete backend scratch file ignores)
 
 # -------------------------
 # Project-specific local artifacts
 # -------------------------
 .codex-backups/
-PROJECT_CHANGE_LOG.md
-START_COMMANDS.md
 .env.example
 !backend/.env.example
 
@@ -143,5 +134,4 @@ skill_graph_cache.json
 backend/skill_graph_cache.json
 backend/skill_graph_cache.tmp
 
-# Docs (local only)
 docs/

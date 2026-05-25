@@ -7,10 +7,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from app.config import Settings
-from app.constants import SUPPORTED_EXTENSIONS
-from app.ocr import OCRUnavailableError, annotate_resume_sections, get_structured_ocr
-from app.preprocess import preprocess
+from app.core.config import Settings
+from app.core.constants import SUPPORTED_EXTENSIONS
+from app.services.ocr import OCRUnavailableError, annotate_resume_sections, get_structured_ocr
+from app.utils.preprocess import preprocess
 
 try:
     from docx import Document

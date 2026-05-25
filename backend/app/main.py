@@ -14,16 +14,16 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from app.agent import HRExtractionService
-from app.config import get_settings
-from app.constants import SUPPORTED_EXTENSIONS
-from app.document_parser import DocumentParser
-from app.ranking import rank_results
-from app.reasoning import generate_reasoning
-from app.schemas import ScreenResumesResponse, ScreeningResult
-from app.scoring import build_recruiter_feedback, score_candidate
-from app.llm_understanding import llm_service
-from app import metrics
+from app.services.agent import HRExtractionService
+from app.core.config import get_settings
+from app.core.constants import SUPPORTED_EXTENSIONS
+from app.services.document_parser import DocumentParser
+from app.services.ranking import rank_results
+from app.services.reasoning import generate_reasoning
+from app.schemas.schemas import ScreenResumesResponse, ScreeningResult
+from app.services.scoring import build_recruiter_feedback, score_candidate
+from app.services.llm_understanding import llm_service
+from app.utils import metrics
 
 _request_id_var = contextvars.ContextVar("request_id", default="-")
 
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Shutting down HR Screening API...")
     try:
-        from app.semantic_matching import get_semantic_matcher
+        from app.services.semantic_matching import get_semantic_matcher
         matcher = get_semantic_matcher()
         if matcher._model:
             del matcher._model

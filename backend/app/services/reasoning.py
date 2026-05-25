@@ -6,8 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.schemas import CandidateScore, JobDescriptionData, ResumeData
-from app.semantic_matching import get_semantic_matcher, lexical_similarity
+from app.schemas.schemas import CandidateScore, JobDescriptionData, ResumeData
+from app.services.semantic_matching import get_semantic_matcher, lexical_similarity
 
 
 class ReasoningOutput(BaseModel):
@@ -315,7 +315,7 @@ def build_reasoning_prompt(job: JobDescriptionData, resume: ResumeData, score: C
     )
 
 
-from app.llm_understanding import llm_service
+from app.services.llm_understanding import llm_service
 
 def generate_reasoning(
     job: JobDescriptionData,

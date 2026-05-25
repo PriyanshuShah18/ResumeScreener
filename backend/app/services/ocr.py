@@ -7,8 +7,8 @@ try:
     import pytesseract
 except ImportError:  # pragma: no cover
     pytesseract = None
-from app.config import get_settings
-from app.constants import CONTACT_HINTS, SECTION_PATTERNS
+from app.core.config import get_settings
+from app.core.constants import CONTACT_HINTS, SECTION_PATTERNS
 
 
 class OCRUnavailableError(RuntimeError):
