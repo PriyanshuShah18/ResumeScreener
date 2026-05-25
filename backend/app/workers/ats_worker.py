@@ -42,14 +42,15 @@ def _configure_worker_logging() -> None:
 
 _suppress_noisy_worker_warnings()
 
-from app.agent import HRExtractionService
-from app.ats_mongo import ATSMongoRepository
-from app.ats_settings import ATSSettings, get_ats_settings
-from app.config import get_settings
-from app.document_parser import DocumentParser
-from app.schemas import CandidateScore, JobDescriptionData, ResumeData, normalize_skill, normalize_whitespace
-from app.scoring import score_candidate
-from app.storage import ResumeDeletedError, S3ResumeStorage
+from app.services.agent import HRExtractionService
+from app.db.ats_mongo import ATSMongoRepository
+from app.core.ats_settings import ATSSettings, get_ats_settings
+from app.core.config import get_settings
+from app.services.document_parser import DocumentParser
+from app.schemas.schemas import CandidateScore, JobDescriptionData, ResumeData
+from app.utils.text_utils import normalize_skill, normalize_whitespace
+from app.services.scoring import score_candidate
+from app.services.storage import ResumeDeletedError, S3ResumeStorage
 
 logger = logging.getLogger(__name__)
 

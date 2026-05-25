@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.ats_settings import ATSSettings
+from app.core.ats_settings import ATSSettings
 
 
 class ATSMongoRepository:

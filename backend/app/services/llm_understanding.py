@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from app.config import get_settings
-from app.schemas import JobDescriptionData, ResumeData, normalize_skill
+from app.core.config import get_settings
+from app.schemas.schemas import JobDescriptionData, ResumeData
+from app.utils.text_utils import normalize_skill
 
 logger = logging.getLogger(__name__)
 

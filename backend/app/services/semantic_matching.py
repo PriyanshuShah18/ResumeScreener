@@ -8,8 +8,8 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any
 
-from app.constants import SKILL_ALIASES
-from app.schemas import normalize_skill
+from app.core.constants import SKILL_ALIASES
+from app.utils.text_utils import normalize_skill
 
 try:
     from sentence_transformers import SentenceTransformer, util
@@ -150,7 +150,7 @@ class SemanticMatcher:
         all_skills = list(set(normalized_jd + normalized_resume))
         skill_graph_default = _get_bool_env("SEMANTIC_MODEL_ENABLED", True)
         if all_skills and _get_bool_env("SEMANTIC_SKILL_GRAPH_ENABLED", skill_graph_default):
-            from app.llm_understanding import llm_service
+            from app.services.llm_understanding import llm_service
             try:
                 llm_service.generate_skill_graph(all_skills)
             except Exception as e:
@@ -313,7 +313,7 @@ class SemanticMatcher:
             return lexical_score
 
         # Primary Intelligence: Check Gemini LLM dynamic skill graph
-        from app.llm_understanding import llm_service, skill_graph_terms
+        from app.services.llm_understanding import llm_service, skill_graph_terms
         try:
             llm_cache = llm_service._load_cache()
             left_terms = [s.lower() for s in skill_graph_terms(llm_cache.get(left_norm))]

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.ats_settings import ATSSettings
+from app.core.ats_settings import ATSSettings
 
 
 @dataclass(frozen=True)

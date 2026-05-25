@@ -7,39 +7,11 @@ from typing import Any
 from dateutil import parser
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.utils.text_utils import normalize_whitespace, split_tokens
+from app.utils.resume_normalizer import filter_education_from_experience_entries, compute_years_of_experience
+
 EMAIL_RE = re.compile(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b")
 PHONE_RE = re.compile(r"(?:(?:\+\d{1,3}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d[\d\s\-]{7,}\d)")
-WHITESPACE_RE = re.compile(r"\s+")
-
-
-def normalize_whitespace(value: Any) -> str:
-    if value is None:
-        return ""
-    return WHITESPACE_RE.sub(" ", str(value)).strip()
-
-
-def normalize_skill(value: str) -> str:
-    cleaned = re.sub(r"[^a-z0-9\+\#\./ ]", " ", normalize_whitespace(value).lower())
-    return WHITESPACE_RE.sub(" ", cleaned).strip(" .,:;")
-
-
-def split_tokens(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        raw_items = value
-    else:
-        raw_items = re.split(r"[\n,;/|]+", str(value))
-
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in raw_items:
-        normalized = normalize_skill(item)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        result.append(normalized)
-    return result
 
 
 def parse_date_value(value: Any) -> str:
@@ -209,25 +181,6 @@ class JobDescriptionData(BaseModel):
         match = re.search(r"(\d+(?:\.\d+)?)", str(value))
         return float(match.group(1)) if match else 0.0
 
-def infer_role_weight(title: str | None, company: str | None) -> float:
-    title = title.lower()
-    company = company.lower()
-
-    #Internship
-    if "intern" in title:
-        return 0.5
-    
-    #Freelance
-    if any (word in title for word in ["freelance", "freelancer", "self-employed"]):
-        return 0.7
-
-    # Contract roles
-    if "contract" in title:
-        return 0.8
-    
-    # Default -> Fulltime
-
-    return 1.0
 class ResumeData(BaseModel):
     name: str = Field(default="", description="Candidate full name")
     email: str = Field(default="", description="Primary email")
@@ -286,58 +239,7 @@ class ResumeData(BaseModel):
     @field_validator("experience_entries", mode="after")
     @classmethod
     def filter_education_from_experience(cls, value: list[ExperienceEntry]) -> list[ExperienceEntry]:
-        filtered = []
-        degree_kw = {"btech", "mtech", "bachelor", "bachelors", "master", "masters", "bsc", "msc", "phd", "degree", "diploma"}
-        edu_inst_kw = {"institute", "university", "college", "school", "academy"}
-        work_kw = {
-            "assistant", "researcher", "professor", "lecturer", "intern", 
-            "developer", "dev", "engineer", "software", "fullstack", "frontend", "backend",
-            "manager", "lead", "coordinator", "tutor", "instructor", "faculty", 
-            "staff", "postdoc", "fellow", "consultant", "freelance", "freelancer", 
-            "founder", "mentor", "creator", "writer", "designer", "editor", "analyst",
-            "specialist", "executive", "administrator", "scientist", "architect", 
-            "technician", "associate", "expert", "officer", "director", "head", 
-            "principal", "president", "vp", "ui", "ux"
-        }
-
-        for entry in value:
-            title_lower = entry.title.lower()
-            company_lower = entry.company.lower()
-            
-            title_words = set(re.findall(r'\b[a-z]+\b', title_lower))
-           
-
-             # 1. If it explicitly spells out b.tech or m.tech with dots
-            if any(term in title_lower for term in ["b.tech", "m.tech", "b.e.", "b.sc", "m.sc"]):
-                continue
-                
-            # 2. If title words contain degree keywords
-            if degree_kw & title_words:
-                continue
-            
-            job_match_strength = len(work_kw & title_words)
-            edu_match_strength = len(degree_kw & title_words)
-
-            if "student" in title_words or "undergraduate" in title_words:
-                edu_match_strength += 2 
-
-            is_job = job_match_strength >=1 and job_match_strength > edu_match_strength 
-
-            if not is_job:
-                continue 
-
-            if entry.duration_months >= 36:
-                if "student" in title_lower or any(
-                    word in company_lower for word in ["college", "university", "institute"]
-                    ):
-                        continue
-
-            if any(word in company_lower for word in ["college", "university", "institute", "school"]):
-                if "intern" not in title_lower:
-                    continue
-            
-            filtered.append(entry)          
-        return filtered
+        return filter_education_from_experience_entries(value)
 
     @field_validator("total_years_experience", mode="before")
     @classmethod
@@ -351,36 +253,7 @@ class ResumeData(BaseModel):
 
     @model_validator(mode="after")
     def compute_years_of_experience(self) -> "ResumeData":
-        #valid_entries = []
-        #for entry in self.experience_entries:
-        #    title = entry.title.lower()
-        #    company = entry.company.lower()
-
-        #    if any(word in company for word in ["college", "university", "institute"]):
-        #        continue
-
-            #if "student" in title:
-            #    continue
-
-            #valid_entries.append(entry)
-
-        weighted_months = 0.0
-
-        for entry in self.experience_entries:
-            weight = infer_role_weight(entry.title, entry.company)
-            weighted_months += entry.duration_months * weight
-
-        calculated_years = round(weighted_months / 12,1)
-
-        if not self.experience_entries:
-            # Prevent hallucinating 4-year degree durations as work experience for freshers
-            self.total_years_experience = 0.0
-        elif calculated_years > 0:
-            # Only overwrite the natively extracted model value if our code mathematically 
-            # computed a strictly greater value. Otherwise, trust the VLM's fallback string extraction
-            # (e.g. from "5+ years of experience" in the summary).
-            if calculated_years >= self.total_years_experience or self.total_years_experience == 0.0:
-                self.total_years_experience = calculated_years
+        self.total_years_experience = compute_years_of_experience(self.experience_entries, self.total_years_experience)
 
         return self
 

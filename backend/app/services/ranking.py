@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.schemas import ScreeningResult
+from app.schemas.schemas import ScreeningResult
 
 
 def _required_match_ratio(result: ScreeningResult) -> float:
