@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any
 
+import httpx
 from app.core.constants import SKILL_ALIASES
 from app.utils.text_utils import normalize_skill
 
@@ -92,9 +93,16 @@ class SemanticMatcher:
         
         self._model = None
         self._model_lock = threading.Lock()
+        # Embedding cache stores text -> numpy array (from HF) or pytorch tensor (from local model)
         self._embedding_cache: dict[str, Any] = {}
-        self._cache_max = 512
+        self._cache_max = 2048
         self.enable_model = enable_model and _HAS_TRANSFORMERS
+        self._hf_api_key: str | None = None
+        self._hf_model_url = "https://router.huggingface.co/hf-inference/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+        # Circuit breaker: flipped to False on first HF failure.
+        # Protected by a lock so parallel resume threads don't all race past the check simultaneously.
+        self._hf_healthy: bool = True
+        self._hf_lock = threading.Lock()
 
     @property
     def model(self):
@@ -108,6 +116,77 @@ class SemanticMatcher:
                     print(f"Failed to load semantic model {self.model_name}: {e}")
                     self.enable_model = False
             return self._model
+
+    def _hf_embed_batch(self, texts: list[str]) -> list[Any] | None:
+        """Fetch embeddings for a list of texts from HuggingFace Serverless API in ONE request.
+
+        This is the bulk pre-computation method. Results are returned as a list of
+        raw embedding vectors (plain Python lists of floats) in the same order as `texts`.
+        Returns None if the API is unavailable, the key is not set, or the circuit is open.
+        The _hf_lock ensures only one thread trips the breaker and prints the log message.
+        """
+        if not self._hf_api_key or not texts:
+            return None
+        # Fast path: check without lock (already tripped)
+        if not self._hf_healthy:
+            return None
+        with self._hf_lock:
+            # Re-check inside lock in case another thread tripped it while we waited
+            if not self._hf_healthy:
+                return None
+            try:
+                from huggingface_hub import InferenceClient
+                client = InferenceClient(token=self._hf_api_key)
+                
+                # InferenceClient requires the fully qualified repository ID.
+                # Local sentence-transformers implicitly adds 'sentence-transformers/', but the Hub API needs it explicitly.
+                repo_id = self.model_name if "/" in self.model_name else f"sentence-transformers/{self.model_name}"
+                
+                # InferenceClient automatically handles the correct router URLs and task payloads.
+                # We use feature_extraction to force it to return raw embeddings.
+                data = client.feature_extraction(texts, model=repo_id)
+                
+                # Output is typically a list of lists (or a numpy array). We ensure it's a list.
+                if hasattr(data, "tolist"):
+                    data = data.tolist()
+                    
+                if isinstance(data, list) and len(data) == len(texts):
+                    return data
+                return None
+            except Exception as exc:
+                # Trip the circuit breaker: log ONCE, then go silent for the rest of the session
+                print(f"HuggingFace API unreachable ({exc}). Falling back to local model for this session.")
+                self._hf_healthy = False
+                # Re-enable local model as a fallback if it was disabled when HF key was configured
+                if not self.enable_model and _HAS_TRANSFORMERS:
+                    self.enable_model = True
+                return None
+
+    def precompute_hf_embeddings(self, terms: list[str]) -> None:
+        """Pre-warm the embedding cache for all given terms in a single HF API call.
+
+        Call this ONCE before a batch of similarity() calls (e.g. at the start of
+        match_skills). Subsequent similarity() calls will read from the in-memory
+        cache and never hit the API again — making per-pair comparison instant.
+        """
+        if not self._hf_api_key or not terms:
+            return
+        import numpy as np
+        # Only fetch terms that are not already cached
+        uncached = [t for t in terms if t not in self._embedding_cache]
+        if not uncached:
+            return
+        embeddings = self._hf_embed_batch(uncached)
+        if embeddings is None:
+            return
+        for text, emb_list in zip(uncached, embeddings):
+            emb = np.array(emb_list, dtype="float32")
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                # Store the L2-normalised vector so cosine similarity = just a dot product
+                self._embedding_cache[text] = emb / norm
+            else:
+                self._embedding_cache[text] = emb
 
 
     def _normalize_terms(self, values: list[str], canonicalize: bool = True) -> list[str]:
@@ -155,6 +234,12 @@ class SemanticMatcher:
                 llm_service.generate_skill_graph(all_skills)
             except Exception as e:
                 print(f"Failed to populate skill graph: {e}")
+
+        # Pre-compute ALL embeddings in ONE batched HF API call before looping.
+        # This avoids making an API call per similarity() invocation (which would be
+        # O(jd_skills × resume_skills) requests — the bug that caused 598s runtimes).
+        if self._hf_api_key:
+            self.precompute_hf_embeddings(all_skills)
 
         matched: list[str] = []
         missing: list[str] = []
@@ -325,7 +410,22 @@ class SemanticMatcher:
         except Exception:
             pass
 
-        # Fallback 2: Sentence-BERT Embeddings (with cache)
+        # Fallback 2a: HuggingFace cached embeddings (pre-computed — instant numpy dot product)
+        # precompute_hf_embeddings() is called once in match_skills() before any loop.
+        # If HF was unavailable, the cache will be empty and we fall through to the local model.
+        import numpy as np
+        left_emb = self._embedding_cache.get(left_norm)
+        right_emb = self._embedding_cache.get(right_norm)
+
+        if left_emb is not None and right_emb is not None:
+            try:
+                # Embeddings stored pre-normalised, so cosine sim = dot product
+                hf_score = float(np.dot(left_emb, right_emb))
+                return max(lexical_score, hf_score)
+            except Exception:
+                pass
+
+        # Fallback 2b: Local Sentence-BERT Embeddings (offline fallback, with cache)
         if self.enable_model and self.model:
             try:
                 def _get_cached_embedding(text):
@@ -378,7 +478,13 @@ def _get_int_env(name: str, default: int, minimum: int = 0) -> int:
 
 @lru_cache(maxsize=1)
 def get_semantic_matcher() -> SemanticMatcher:
-    return SemanticMatcher(
+    from app.core.config import get_settings
+    settings = get_settings()
+    hf_key = settings.hf_api_key or os.getenv("HF_API_KEY")
+    # When HF API is active, disable the local PyTorch model — it's not needed
+    # and loading it wastes RAM and startup time on cloud servers.
+    local_model_default = not bool(hf_key)
+    matcher = SemanticMatcher(
         model_name=os.getenv("SEMANTIC_MODEL_NAME", "all-MiniLM-L6-v2"),
         semantic_threshold=_get_float_env("SEMANTIC_THRESHOLD", 0.75),
         partial_threshold=_get_float_env("SEMANTIC_PARTIAL_THRESHOLD", 0.60),
@@ -386,5 +492,9 @@ def get_semantic_matcher() -> SemanticMatcher:
         additional_relevance_threshold=_get_float_env("SEMANTIC_ADDITIONAL_THRESHOLD", 0.60),
         clustering_threshold=_get_float_env("SEMANTIC_CLUSTER_THRESHOLD", 0.78),
         domain_bonus_max=_get_int_env("SEMANTIC_DOMAIN_BONUS_MAX", 8),
-        enable_model=_get_bool_env("SEMANTIC_MODEL_ENABLED", True),
+        enable_model=_get_bool_env("SEMANTIC_MODEL_ENABLED", local_model_default),
     )
+    if hf_key:
+        matcher._hf_api_key = hf_key
+        print(f"✅ HuggingFace Serverless Inference API enabled — local model disabled")
+    return matcher

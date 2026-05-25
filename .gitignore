@@ -133,5 +133,3 @@ tests/
 skill_graph_cache.json
 backend/skill_graph_cache.json
 backend/skill_graph_cache.tmp
-
-docs/

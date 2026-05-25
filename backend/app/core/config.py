@@ -36,6 +36,7 @@ class Settings:
     gemini_api_key: str | None
     groq_api_key: str | None
     openrouter_api_key: str | None
+    hf_api_key: str | None
     scrub_pii_for_llm: bool
     allowed_origins: tuple[str, ...] = ("http://localhost:5173",)
 
@@ -55,6 +56,7 @@ def get_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
         groq_api_key=os.getenv("GROQ_API_KEY"),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+        hf_api_key=os.getenv("HF_API_KEY"),
         scrub_pii_for_llm=_get_bool("SCRUB_PII_FOR_LLM", False),
         allowed_origins=tuple(
             o.strip()
