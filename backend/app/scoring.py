@@ -5,6 +5,8 @@ import re
 from typing import Any
 
 from app.constants import (
+    JD_NON_SKILL_PHRASES,
+    JD_ROLE_ALIASES,
     SCORING_SKILL_NOISE as SKILL_NOISE,
     SCORING_CONFIG,
     SENIORITY_MAP,
@@ -27,6 +29,43 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 def normalize_set(values: list[str]) -> set[str]:
     normalized = {canonicalize_skill(value) for value in values if canonicalize_skill(value)}
     return {value for value in normalized if value and value not in SKILL_NOISE}
+
+
+def sanitize_jd_skill_terms(values: list[str], limit: int | None = None) -> list[str]:
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = normalize_skill(value)
+        if not cleaned:
+            continue
+        for alias, replacement in JD_ROLE_ALIASES.items():
+            cleaned = re.sub(rf"\b{re.escape(alias)}\b", replacement, cleaned)
+        cleaned = normalize_skill(cleaned)
+        if not cleaned or cleaned in JD_NON_SKILL_PHRASES or cleaned in SKILL_NOISE:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        sanitized.append(cleaned)
+        if limit is not None and len(sanitized) >= limit:
+            break
+    return sanitized
+
+
+def bonus_caps_for_required_match_ratio(
+    required_match_ratio: float,
+    *,
+    base_additional_cap: int = 10,
+    base_domain_cap: int = 8,
+) -> tuple[int, int]:
+    ratio = clamp(required_match_ratio, 0.0, 1.0)
+    if ratio == 0.0:
+        return min(base_additional_cap, 2), min(base_domain_cap, 1)
+    if ratio < 0.34:
+        return min(base_additional_cap, 4), min(base_domain_cap, 2)
+    if ratio < 0.67:
+        return min(base_additional_cap, 6), min(base_domain_cap, 3)
+    return max(base_additional_cap, 0), max(base_domain_cap, 0)
 
 
 # ─── Impact Signal Extraction (reporting only, not scored) ──────────────────
@@ -93,6 +132,58 @@ def extract_phrases(value: str, limit: int = 15, max_tokens: int = 4) -> list[st
     return candidates
 
 
+def is_skill_like_additional_term(term: str) -> bool:
+    normalized = canonicalize_skill(term)
+    if not normalized or normalized in SKILL_NOISE:
+        return False
+
+    tokens = normalized.split()
+    if not tokens:
+        return False
+
+    # Hide project labels from "Additional Relevant Skills" cards.
+    # Examples: "chat app", "expense tracker app", "shopping list app".
+    project_label_tail_tokens = {
+        "app",
+        "apps",
+        "application",
+        "project",
+        "projects",
+        "website",
+        "site",
+        "portal",
+        "dashboard",
+    }
+    if len(tokens) >= 2 and tokens[-1] in project_label_tail_tokens:
+        return False
+
+    return True
+
+
+def filter_additional_relevant_skill_matches(
+    skills: list[str],
+    details: list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    filtered_skills: list[str] = []
+    allowed: set[str] = set()
+    for skill in skills:
+        normalized = canonicalize_skill(skill)
+        if not is_skill_like_additional_term(normalized):
+            continue
+        if normalized in allowed:
+            continue
+        allowed.add(normalized)
+        filtered_skills.append(normalized)
+
+    filtered_details: list[dict[str, Any]] = []
+    for detail in details:
+        resume_skill = canonicalize_skill(detail.get("resume_skill", ""))
+        if resume_skill in allowed:
+            filtered_details.append({**detail, "resume_skill": resume_skill})
+
+    return filtered_skills, filtered_details
+
+
 def keyword_set(job: JobDescriptionData) -> set[str]:
     title_tokens = {
         token
@@ -140,16 +231,20 @@ def candidate_skill_evidence(resume: ResumeData) -> dict[str, float]:
 def cluster_skill_evidence(
     skill_evidence: dict[str, float],
     matcher: SemanticMatcher,
-) -> tuple[dict[str, float], list[dict[str, Any]]]:
+) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, float]]:
     clusters = matcher.cluster_skills(list(skill_evidence.keys()))
     clustered_evidence: dict[str, float] = {}
     cluster_details: list[dict[str, Any]] = []
+    term_evidence: dict[str, float] = {}
 
     for cluster in clusters:
         canonical = cluster["canonical"]
         members = cluster["members"]
         max_weight = max((skill_evidence.get(member, 0.0) for member in members), default=0.0)
         clustered_evidence[canonical] = max_weight
+        term_evidence[canonical] = max(term_evidence.get(canonical, 0.0), max_weight)
+        for member in members:
+            term_evidence[member] = max(term_evidence.get(member, 0.0), max_weight)
         cluster_details.append(
             {
                 "canonical": canonical,
@@ -158,7 +253,7 @@ def cluster_skill_evidence(
             }
         )
 
-    return clustered_evidence, cluster_details
+    return clustered_evidence, cluster_details, term_evidence
 
 
 def semantic_coverage(reference_terms: list[str], candidate_terms: list[str], matcher: SemanticMatcher) -> float:
@@ -316,32 +411,107 @@ def score_budget(job: JobDescriptionData) -> dict[str, int]:
     return {"skills": 40, "experience": 30, "education": 15, "keyword": 10, "completeness": 5}
 
 
+def match_required_skill_clusters(
+    required_clusters: list[dict[str, Any]],
+    candidate_terms: list[str],
+    matcher: SemanticMatcher,
+) -> dict[str, Any]:
+    matched: list[str] = []
+    missing: list[str] = []
+    details: list[dict[str, Any]] = []
+    matched_candidates: set[str] = set()
+
+    for cluster in required_clusters:
+        cluster_label = cluster.get("canonical", "")
+        cluster_members = cluster.get("members") or [cluster_label]
+
+        best_jd_member = cluster_label
+        best_candidate = ""
+        best_similarity = 0.0
+
+        for jd_member in cluster_members:
+            candidate, similarity = matcher.best_match(jd_member, candidate_terms)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_candidate = candidate
+                best_jd_member = jd_member
+
+        is_match = bool(best_candidate) and best_similarity >= matcher.required_match_threshold
+        if is_match:
+            matched.append(cluster_label)
+            matched_candidates.add(best_candidate)
+        else:
+            missing.append(cluster_label)
+
+        details.append(
+            {
+                "jd_skill": cluster_label,
+                "matched_jd_member": best_jd_member,
+                "matched_skill": best_candidate,
+                "similarity": round(best_similarity, 3),
+                "is_match": is_match,
+                "threshold": round(matcher.required_match_threshold, 3),
+            }
+        )
+
+    return {
+        "matched": matched,
+        "missing": missing,
+        "details": details,
+        "matched_candidates": sorted(matched_candidates),
+    }
+
+
+def internship_or_trainee_dominant(resume: ResumeData) -> bool:
+    entries = [entry for entry in resume.experience_entries if normalize_skill(entry.title)]
+    if not entries:
+        return False
+    internship_like = 0
+    for entry in entries:
+        title = normalize_skill(entry.title)
+        if re.search(r"\b(intern|internship|trainee|apprentice)\b", title):
+            internship_like += 1
+    return (internship_like / len(entries)) >= 0.5
+
+
 def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateScore:
     matcher = get_semantic_matcher()
     budgets = score_budget(job)
 
-    required_clusters = matcher.cluster_skills(sorted(normalize_set(job.must_have_skills)))
-    preferred_clusters = matcher.cluster_skills(sorted(normalize_set(job.good_to_have_skills)))
+    # Scoring-level sanitation guards against noisy parser/LLM JD output.
+    sanitized_required = sanitize_jd_skill_terms(job.must_have_skills)
+    sanitized_preferred = sanitize_jd_skill_terms(job.good_to_have_skills)
+
+    required_clusters = matcher.cluster_skills(sorted(normalize_set(sanitized_required)))
+    preferred_clusters = matcher.cluster_skills(sorted(normalize_set(sanitized_preferred)))
     required_skills = [cluster["canonical"] for cluster in required_clusters]
     preferred_skills = [cluster["canonical"] for cluster in preferred_clusters]
 
     raw_skill_evidence = candidate_skill_evidence(resume)
-    clustered_skill_evidence, candidate_clusters = cluster_skill_evidence(raw_skill_evidence, matcher)
+    clustered_skill_evidence, candidate_clusters, candidate_term_evidence = cluster_skill_evidence(raw_skill_evidence, matcher)
     candidate_skills = sorted(clustered_skill_evidence.keys())
+    candidate_skill_terms = sorted(candidate_term_evidence.keys())
 
-    required_match = matcher.match_skills(
-        required_skills,
-        candidate_skills,
-        threshold=matcher.required_match_threshold,
+    required_match = match_required_skill_clusters(
+        required_clusters,
+        candidate_skill_terms,
+        matcher,
     )
     preferred_match = matcher.match_skills(
         preferred_skills,
-        candidate_skills,
+        candidate_skill_terms,
         threshold=matcher.semantic_threshold,
     )
 
     matched_required = required_match["matched"]
     missing_required = required_match["missing"]
+    required_required_count = len(required_skills)
+    matched_required_count = len(matched_required)
+    required_match_ratio = (
+        matched_required_count / required_required_count
+        if required_required_count
+        else 1.0
+    )
     critical_missing = [
         detail["jd_skill"] for detail in required_match["details"] if detail["similarity"] < matcher.partial_threshold
     ]
@@ -354,8 +524,10 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     for detail in required_match["details"]:
         matched_skill = detail["matched_skill"]
         similarity = float(detail["similarity"])
-        evidence_weight = clustered_skill_evidence.get(matched_skill, 0.0)
-        credit = matcher.similarity_credit(similarity) * evidence_weight
+        evidence_weight = candidate_term_evidence.get(matched_skill, 0.0)
+        # Required skills are hard signals: no partial credit unless the
+        # required-threshold match succeeded.
+        credit = (matcher.similarity_credit(similarity) * evidence_weight) if detail["is_match"] else 0.0
         required_credit += credit
         required_details.append(
             {
@@ -368,7 +540,7 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     for detail in preferred_match["details"]:
         matched_skill = detail["matched_skill"]
         similarity = float(detail["similarity"])
-        evidence_weight = clustered_skill_evidence.get(matched_skill, 0.0)
+        evidence_weight = candidate_term_evidence.get(matched_skill, 0.0)
         credit = matcher.similarity_credit(similarity) * evidence_weight
         preferred_credit += credit
         preferred_details.append(
@@ -398,15 +570,21 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         skill_ratio = 1.0
 
     skills_score = round(budgets["skills"] * skill_ratio)
+    # Harden against random profiles: if required-skill coverage is weak,
+    # clamp the skills contribution so preferred/semantic noise cannot dominate.
+    if required_skills and required_match_ratio == 0.0:
+        skills_score = min(skills_score, round(budgets["skills"] * 0.15))
+    elif required_skills and required_match_ratio < 0.34:
+        skills_score = min(skills_score, round(budgets["skills"] * 0.30))
 
     keyword_reference = sorted(keyword_set(job))
     jd_context_terms = sorted(
         normalize_set(
-            job.must_have_skills
-            + job.good_to_have_skills
+            sanitized_required
+            + sanitized_preferred
             + job.domain_keywords
             + keyword_reference
-            + extract_phrases(job.title, limit=8)
+            + sanitize_jd_skill_terms(extract_phrases(job.title, limit=8), limit=8)
             + extract_phrases("\n".join(job.responsibilities), limit=20)
         )
     )
@@ -422,12 +600,18 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         exclude=excluded_candidates,
         threshold=matcher.additional_relevance_threshold,
     )
-    additional_skills_bonus_score = min(len(additional_relevant_skills) * 2, 10)
+    additional_relevant_skills, additional_relevant_details = filter_additional_relevant_skill_matches(
+        additional_relevant_skills,
+        additional_relevant_details,
+    )
+    additional_skills_bonus_raw = len(additional_relevant_skills) * 2
 
     if job.min_years_experience > 0:
         years_fit = clamp(resume.total_years_experience / job.min_years_experience, 0.0, 1.0)
     else:
-        years_fit = 1.0
+        # "No minimum experience required" should not grant full experience credit.
+        # For open-entry roles, scale years contribution against a soft baseline.
+        years_fit = clamp(resume.total_years_experience / 2.0, 0.0, 1.0)
 
     target_seniority = infer_seniority_level(job.title + " " + " ".join(job.responsibilities))
     candidate_peak_seniority = max((infer_seniority_level(entry.title) for entry in resume.experience_entries), default=0)
@@ -439,7 +623,7 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         seniority_fit = 0.0
 
     growth_fit = progression_score(resume)
-    domain_reference = list(normalize_set(job.domain_keywords + job.must_have_skills + job.good_to_have_skills))
+    domain_reference = list(normalize_set(job.domain_keywords + sanitized_required + sanitized_preferred))
     domain_reference.extend(keyword_reference)
     resume_domain_terms = experience_domain_terms(resume)
     domain_alignment = semantic_coverage(domain_reference, resume_domain_terms, matcher)
@@ -448,13 +632,24 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         resume_domain_terms,
         threshold=matcher.additional_relevance_threshold,
     )
-    domain_bonus_score = min(len(detected_domain_tags), matcher.domain_bonus_max)
+    domain_bonus_raw = len(detected_domain_tags)
+    additional_skills_cap, domain_bonus_cap = bonus_caps_for_required_match_ratio(
+        required_match_ratio,
+        base_additional_cap=10,
+        base_domain_cap=matcher.domain_bonus_max,
+    )
+    additional_skills_bonus_score = min(additional_skills_bonus_raw, additional_skills_cap)
+    domain_bonus_score = min(domain_bonus_raw, domain_bonus_cap)
 
     if resume.total_years_experience == 0:
         experience_score = 0
     else:
         experience_ratio = clamp(0.40 * years_fit + 0.25 * seniority_fit + 0.15 * growth_fit + 0.20 * domain_alignment, 0.0, 1.0)
+        if resume.total_years_experience < 1.0:
+            experience_ratio = min(experience_ratio, 0.35)
         experience_score = round(budgets["experience"] * experience_ratio)
+        if internship_or_trainee_dominant(resume) and required_match_ratio < 0.5:
+            experience_score = min(experience_score, round(budgets["experience"] * 0.25))
 
     education_fit = education_ratio(job, resume, matcher)
     education_score = round(budgets["education"] * clamp(education_fit, 0.0, 1.0))
@@ -496,9 +691,15 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
     confidence_score = round(
         clamp(
             (
-                0.40 * skill_ratio
-                + 0.30 * completeness_ratio
+                0.30 * skill_ratio
+                + 0.25 * completeness_ratio
                 + 0.15 * min(len(candidate_skills) / 12, 1.0)
+                + 0.15 * (
+                    sum(detail["evidence_weight"] for detail in required_details if detail["is_match"])
+                    / max(len([detail for detail in required_details if detail["is_match"]]), 1)
+                    if required_details
+                    else 1.0
+                )
                 + 0.10 * min(len(additional_relevant_skills) / 5, 1.0)
                 + 0.05 * domain_alignment
             )
@@ -565,7 +766,19 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         elif ownership <= 0.2:
             risks.append("Contributor-heavy language — may not have driven outcomes independently")
 
+    matched_required_evidence_weights = [
+        detail["evidence_weight"] for detail in required_details if detail["is_match"]
+    ]
+    required_proof_ratio = (
+        sum(matched_required_evidence_weights) / len(matched_required_evidence_weights)
+        if matched_required_evidence_weights
+        else (1.0 if not required_details else 0.0)
+    )
+
     semantic_details = {
+        "required_match_ratio": round(required_match_ratio, 3),
+        "required_required_count": required_required_count,
+        "matched_required_count": matched_required_count,
         "required": required_details,
         "preferred": preferred_details,
         "required_clusters": required_clusters,
@@ -583,6 +796,17 @@ def score_candidate(job: JobDescriptionData, resume: ResumeData) -> CandidateSco
         "bonus_scores": {
             "additional_skills_bonus_score": additional_skills_bonus_score,
             "domain_bonus_score": domain_bonus_score,
+            "additional_skills_bonus_raw": additional_skills_bonus_raw,
+            "domain_bonus_raw": domain_bonus_raw,
+        },
+        "applied_bonus_caps": {
+            "additional_skills_cap": additional_skills_cap,
+            "domain_bonus_cap": domain_bonus_cap,
+        },
+        "evidence_weighted_confidence": {
+            "required_proof_ratio": round(required_proof_ratio, 3),
+            "score": round(required_proof_ratio * 100),
+            "meaning": "Matched required skills backed by experience/project evidence score higher than list-only skills.",
         },
     }
 
@@ -615,7 +839,21 @@ def build_recruiter_feedback(
     reasoning_summary: str = "",
 ) -> str:
     if reasoning_summary.strip():
-        return reasoning_summary.strip()
+        sanitized_summary = reasoning_summary.strip()
+        if not score.critical_missing_skills:
+            sanitized_summary = re.sub(
+                r"\bcritical missing skills?\b",
+                "missing required skills",
+                sanitized_summary,
+                flags=re.IGNORECASE,
+            )
+            sanitized_summary = re.sub(
+                r"\bcritical skill gaps?\b",
+                "skill gaps",
+                sanitized_summary,
+                flags=re.IGNORECASE,
+            )
+        return sanitized_summary
 
     headline = f"{resume.name or 'Candidate'} was scored for {job.title or 'the role'} with a total score of {score.total_score}/100."
     notes = score.strengths[:2] + score.risks[:2]
