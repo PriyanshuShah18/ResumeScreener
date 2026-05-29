@@ -50,7 +50,7 @@ class ATSSettings:
 
     def require_s3_credentials(self) -> tuple[str, str]:
         if not self.s3_access_key_id or not self.s3_secret_access_key:
-            raise RuntimeError("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required to download resumes")
+            raise RuntimeError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required to download resumes")
         return self.s3_access_key_id, self.s3_secret_access_key
 
 
@@ -60,9 +60,9 @@ def get_ats_settings() -> ATSSettings:
         mongodb_db=os.getenv("MONGODB_DB", "Os"),
         organization_id=os.getenv("DEFAULT_ORGANIZATION_ID", "codnestx"),
         s3_bucket=os.getenv("S3_BUCKET", "harsh-gajjar-280"),
-        s3_region=os.getenv("S3_REGION", "ap-southeast-2"),
-        s3_access_key_id=os.getenv("S3_ACCESS_KEY_ID"),
-        s3_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY"),
+        s3_region=os.getenv("AWS_REGION") or os.getenv("S3_REGION", "ap-southeast-2"),
+        s3_access_key_id=os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("S3_ACCESS_KEY_ID"),
+        s3_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("S3_SECRET_ACCESS_KEY"),
         s3_endpoint_url=os.getenv("S3_ENDPOINT_URL"),
         poll_interval_seconds=_get_int("ATS_POLL_INTERVAL_SECONDS", 60, minimum=1),
         batch_size=_get_int("ATS_BATCH_SIZE", 25, minimum=1),
